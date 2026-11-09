@@ -45,7 +45,9 @@ def lite_server():
         pytest.fail("the `claude` CLI is not on PATH")
     proc = None
     if not _health():
+        # MCP_PORT in the environment beats the .env value, so the dev server can stay on 8000.
         proc = subprocess.Popen(["uv", "run", "ews-mcp-lite"], cwd=REPO,
+                                env={**os.environ, "MCP_PORT": str(PORT)},
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + 60
     while time.time() < deadline:

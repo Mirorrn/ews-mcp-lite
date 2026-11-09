@@ -5,7 +5,7 @@ description = "Minimal MCP server for Microsoft Exchange (EWS): FastAPI + the of
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 keywords = ["mcp", "exchange", "ews", "fastapi", "model-context-protocol"]
 dependencies = [
     "exchangelib==5.0.3",
@@ -31,7 +31,7 @@ dev = [
 
 [tool.ruff]
 line-length = 140
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

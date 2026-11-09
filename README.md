@@ -9,7 +9,7 @@ people, tasks, drafts and (explicitly enabled) sending.
 - **28 tools** in three capability tiers, with v5's safety chain: kill-switch, circuit breaker,
   startup gate, recipient guard and two-phase confirmation
 - Short id aliases (`m1`, `e2`, `d3` …) and compact result cards instead of raw EWS ids and HTML
-- Built with **uv**; Python 3.12+
+- Built with **uv**; Python 3.13+
 
 It is a slimmed-down sibling of [ews-mcp](https://github.com/azizmazrou/ews-mcp) (v5 /
 release line 4.5). See [Differences from ews-mcp v5](#differences-from-ews-mcp-v5).
@@ -48,7 +48,7 @@ Environment variables (or a `.env` file in the working directory). See [.env.exa
 | `EWS_TZ` | `UTC` | IANA timezone for `today`, `+1d`, naive times and rendered dates |
 | `EWS_CAPABILITY_TIER` | `draft` | `read`, `draft` or `full`; tools above the tier are not registered |
 | `SEND_ENABLED` | `false` | Kill-switch for everything that leaves the mailbox |
-| `EWS_RECIPIENT_ALLOWLIST` | | Comma-separated globs; if set, every recipient must match one |
+| `EWS_RECIPIENT_ALLOWLIST` | | Comma-separated globs; if set, every recipient of outgoing mail must match one (drafts are not checked until sent) |
 | `EWS_RECIPIENT_DENYLIST` | | Comma-separated globs; matching recipients are always refused |
 | `SEND_CONFIRM_SECRET` | random per process | HMAC secret for confirm tokens |
 | `CONFIRM_TTL_SECONDS` | `600` | Confirm token lifetime |
@@ -136,9 +136,11 @@ kill-switch → tier → circuit breaker → startup gate → recipient guard �
    fast with `upstream_unavailable` and a hint to call `get_server_status`, which always
    works and reports the state (`connecting` / `warm` / `failed` after rejected credentials).
 5. **Recipient guard.** `EWS_RECIPIENT_ALLOWLIST` / `EWS_RECIPIENT_DENYLIST` (comma-separated,
-   case-insensitive globs such as `*@example.com`) are checked on the recipients of
-   `create_draft`, `update_draft`, `create_event` and `update_event`, and on the **draft's own
-   recipients** at `send_draft`. Violations return `recipient_blocked`.
+   case-insensitive globs such as `*@example.com`) are checked only where mail leaves the
+   mailbox: on the **draft's own recipients** at `send_draft`, and on the attendees of
+   `create_event` with `send_invitations=true`. Drafts (`create_draft`, `update_draft`), events
+   without invitations and `check_availability` accept any address; a draft to a blocked
+   address can be written but not sent. Violations return `recipient_blocked`.
 6. **Two-phase confirm.** `send_draft`, `respond_to_event`, `cancel_event`, `set_oof` and
    `delete_messages` execute nothing on the first call: they return a preview and a
    `confirm_token` (HMAC-SHA256, valid `CONFIRM_TTL_SECONDS` = 600, single use). The second
@@ -203,6 +205,28 @@ dev/grommunio/setup.sh       # ~10 min on first run
 dev/grommunio/teardown.sh    # stop and delete all data
 ```
 
+Once it is up (the certificate is self-signed, so the browser warns first):
+
+| What | URL | Login (setup.sh defaults) |
+|---|---|---|
+| Webmail (grommunio-web) | https://127.0.0.1/web/ | `alice@grommunio.test` / `Al1cePass!` or `bob@grommunio.test` / `B0bPass!!` |
+| Admin UI | https://127.0.0.1:8443/ | `admin` / `GrommAdmin-4711` |
+| EWS endpoint | https://127.0.0.1/EWS/Exchange.asmx | as webmail |
+
+The passwords can be changed with `ALICE_PASS`, `BOB_PASS` and `GROMMUNIO_ADMIN_PASS`
+when running `setup.sh`.
+
+Shortcut: `make setup-dev` once (deps + grommunio + `.env`), then `make dev` to start
+grommunio and the MCP server; `make stop` stops grommunio and keeps its data.
+
+To run the server itself against it by hand (as alice, all tools on, sends limited to
+`*@grommunio.test`):
+
+```bash
+cp dev/grommunio/.env.example .env
+uv run ews-mcp-lite
+```
+
 Then run the integration suite against it:
 
 ```bash
@@ -254,7 +278,6 @@ EWS_TZ=Europe/Berlin
 EWS_CAPABILITY_TIER=full
 SEND_ENABLED=true
 EWS_RECIPIENT_ALLOWLIST=*@grommunio.test
-MCP_PORT=18900
 ```
 
 **2. Seed a believable work week** (refuses to run unless the EWS host is local and
@@ -281,7 +304,8 @@ tests assert against.
 EWS_AGENTIC=1 uv run pytest -m agentic -s
 ```
 
-The session fixture reuses a warm server on `MCP_PORT` or starts `uv run ews-mcp-lite`;
+The session fixture reuses a warm server on port 18900 (`EWS_AGENTIC_PORT`) or starts
+`uv run ews-mcp-lite` there, so it never clashes with a dev server on 8000;
 each scenario re-seeds the mailbox. The agent runs as
 `claude -p … --strict-mcp-config --tools "" --allowedTools "mcp__ews-lite__*"`, so it can
 use nothing but the ews-lite tools.

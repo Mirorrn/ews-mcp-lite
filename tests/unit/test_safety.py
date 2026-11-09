@@ -66,9 +66,11 @@ async def test_order_circuit_before_gate(server_factory):
 
 
 async def test_order_gate_before_recipient_guard(server_factory):
-    mcp, _, gw = server_factory(ews_recipient_denylist="*@evil.example")
+    mcp, _, gw = server_factory(send_enabled=True, ews_recipient_denylist="*@evil.example")
     gw.state = "connecting"
-    ok, err = await call(mcp, "create_draft", {"to": ["x@evil.example"], "body": "b"})
+    ok, err = await call(mcp, "create_event", {"subject": "s", "start": "2030-01-01T10:00",
+                                               "end": "2030-01-01T11:00", "attendees": ["x@evil.example"],
+                                               "send_invitations": True})
     assert not ok and err["code"] == "upstream_unavailable"
 
 
@@ -195,17 +197,32 @@ def test_recipient_globs_case_insensitive():
         check_recipients(["CEO@corp.example"], ["*@corp.example"], ["ceo@*"], "t")
 
 
+EVENT = {"subject": "s", "start": "2030-01-01T10:00", "end": "2030-01-01T11:00",
+         "attendees": ["x@other.example"]}
+
+
+async def test_recipient_guard_on_sending_arguments(server_factory):
+    """An event that sends invitations is checked before anything runs."""
+    mcp, _, gw = server_factory(send_enabled=True, ews_recipient_allowlist="*@corp.example")
+    ok, err = await call(mcp, "create_event", {**EVENT, "send_invitations": True})
+    assert not ok and err["code"] == "recipient_blocked"
+    gw.mock_account.fetch.assert_not_called()
+
+
 @pytest.mark.parametrize("tool,args", [
     ("create_draft", {"to": ["ok@corp.example"], "cc": ["x@other.example"], "body": "b"}),
     ("update_draft", {"draft_id": "AAMkRAW", "bcc": ["x@other.example"]}),
-    ("create_event", {"subject": "s", "start": "2030-01-01T10:00", "end": "2030-01-01T11:00",
-                      "attendees": ["x@other.example"]}),
+    ("create_event", EVENT),
+    ("check_availability", {"attendees": ["x@other.example"], "start": "2030-01-01T09:00",
+                            "end": "2030-01-01T17:00"}),
 ])
-async def test_recipient_guard_on_arguments(server_factory, tool, args):
-    mcp, _, gw = server_factory(ews_recipient_allowlist="*@corp.example")
+async def test_recipient_guard_skips_mailbox_local_calls(server_factory, tool, args):
+    """Drafts, events without invitations and free/busy lookups send nothing, so any
+    address is accepted; send_draft checks the draft's recipients later."""
+    mcp, _, gw = server_factory(ews_recipient_allowlist="*@corp.example",
+                                ews_recipient_denylist="*@other.example")
     ok, err = await call(mcp, tool, args)
-    assert not ok and err["code"] == "recipient_blocked"
-    gw.mock_account.fetch.assert_not_called()
+    assert ok or err["code"] != "recipient_blocked"
 
 
 async def test_recipient_guard_on_resolved_draft_recipients(server_factory):

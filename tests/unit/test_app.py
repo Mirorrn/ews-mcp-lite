@@ -22,6 +22,16 @@ def test_health_is_public():
     assert r.status_code == 200 and r.json()["tools"] == 23 and r.json()["send_enabled"] is False
 
 
+def test_swagger_is_public_and_lists_only_health():
+    with _client(mcp_api_key="secret") as c:
+        docs = c.get("/docs")
+        schema = c.get("/openapi.json")
+        redoc = c.get("/redoc")
+    assert docs.status_code == 200 and "swagger-ui" in docs.text
+    assert schema.status_code == 200 and list(schema.json()["paths"]) == ["/health"]
+    assert redoc.status_code != 200
+
+
 def test_mcp_requires_bearer_when_key_set():
     with _client(mcp_api_key="secret") as c:
         assert c.post("/mcp", json=INIT, headers=HEADERS).status_code == 401

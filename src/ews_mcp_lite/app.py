@@ -6,7 +6,7 @@ mounted app's lifespan, so the host lifespan enters ``session_manager.run()``.
 
 import hmac
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import anyio
@@ -30,6 +30,15 @@ INSTRUCTIONS = (
     "again with confirm_token only after they approve."
 )
 
+DOCS_DESCRIPTION = (
+    "Only the plain HTTP endpoints are listed here. The MCP tools are served over the MCP "
+    "protocol (JSON-RPC) at `/mcp`; browse and call them with the MCP Inspector "
+    "(`npx @modelcontextprotocol/inspector`, transport Streamable HTTP)."
+)
+# Reachable without the bearer token: the health check, and Swagger UI with its schema
+# (a browser cannot attach the header when opening /docs; the schema only covers /health).
+PUBLIC_PATHS = frozenset({"/health", "/docs", "/docs/oauth2-redirect", "/openapi.json"})
+
 
 def build_server(settings: Settings, gateway: Gateway | None = None) -> tuple[MCPServer, Context]:
     ctx = Context(settings=settings, gateway=gateway or Gateway(settings))
@@ -47,7 +56,7 @@ def build_app(settings: Settings | None = None, gateway: Gateway | None = None) 
     mcp_app = mcp.streamable_http_app(host=settings.mcp_host)  # creates mcp.session_manager
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
         async with anyio.create_task_group() as tg:
             tg.start_soon(ctx.gateway.warmup)  # never blocks startup; Exchange may be down
             async with mcp.session_manager.run():
@@ -55,13 +64,13 @@ def build_app(settings: Settings | None = None, gateway: Gateway | None = None) 
             tg.cancel_scope.cancel()
 
     app = FastAPI(title="ews-mcp-lite", version=__version__, lifespan=lifespan,
-                  docs_url=None, redoc_url=None)
+                  description=DOCS_DESCRIPTION, redoc_url=None)
     app.state.ctx = ctx
 
     @app.middleware("http")
     async def bearer_auth(request: Request, call_next):
         key = settings.mcp_api_key
-        if key and request.url.path != "/health":
+        if key and request.url.path not in PUBLIC_PATHS:
             header = request.headers.get("authorization", "")
             token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
             if not hmac.compare_digest(token, key):

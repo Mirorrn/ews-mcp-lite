@@ -37,6 +37,8 @@ KIND_ANNOTATIONS = {
 }
 CONFIRM_KINDS = ("send", "destructive")
 RECIPIENT_ARGS = ("to", "cc", "bcc", "attendees")
+# Flags that make an otherwise mailbox-local call send mail (create_event invitations).
+SEND_FLAGS = ("send_invitations", "notify_attendees")
 
 # A resolver turns call arguments into what a confirm token binds:
 #   {"preview": {...}, "material": <anything JSON-able>, "recipients": [...]}
@@ -123,6 +125,10 @@ def _recipients_in(kwargs: dict[str, Any]) -> list[str]:
     return out
 
 
+def _sends(spec: ToolSpec, kwargs: dict[str, Any]) -> bool:
+    return spec.kind == "send" or any(kwargs.get(flag) for flag in SEND_FLAGS)
+
+
 async def dispatch(ctx: Context, spec: ToolSpec, kwargs: dict[str, Any]) -> dict[str, Any]:
     s = ctx.settings
     token = kwargs.pop("confirm_token", None)
@@ -140,8 +146,11 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: dict[str, Any]) -> dict
     if spec.confirm and token:  # replayed/forged/expired tokens fail before any EWS work
         assert ctx.confirmer is not None
         ctx.confirmer.precheck(token, spec.name)
-    # 5. recipient guard: argument recipients, then resolved recipients (send_draft)
-    check_recipients(_recipients_in(kwargs), s.allowlist, s.denylist, spec.name)
+    # 5. recipient guard, only where something leaves the mailbox: argument recipients of a
+    #    sending call, then resolved recipients (send_draft checks the draft's own). Drafts and
+    #    free/busy lookups may name anyone; the guard catches them when they are sent.
+    if _sends(spec, kwargs):
+        check_recipients(_recipients_in(kwargs), s.allowlist, s.denylist, spec.name)
     resolved = None
     if spec.confirm or spec.resolve:
         resolved = await (spec.resolve(kwargs) if spec.resolve else _default_resolve(spec, kwargs))
