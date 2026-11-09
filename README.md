@@ -6,7 +6,8 @@ people, tasks, drafts and (explicitly enabled) sending.
 
 - **FastAPI** host with the **official MCP Python SDK** (Streamable HTTP) mounted at `/mcp`
 - **Live EWS only**: no cache, no database, no background sync
-- **28 tools** in three capability tiers, plus a kill-switch for anything that leaves the mailbox
+- **28 tools** in three capability tiers, with v5's safety chain: kill-switch, circuit breaker,
+  startup gate, recipient guard and two-phase confirmation
 - Short id aliases (`m1`, `e2`, `d3` …) and compact result cards instead of raw EWS ids and HTML
 - Built with **uv**; Python 3.12+
 
@@ -47,6 +48,13 @@ Environment variables (or a `.env` file in the working directory). See [.env.exa
 | `EWS_TZ` | `UTC` | IANA timezone for `today`, `+1d`, naive times and rendered dates |
 | `EWS_CAPABILITY_TIER` | `draft` | `read`, `draft` or `full`; tools above the tier are not registered |
 | `SEND_ENABLED` | `false` | Kill-switch for everything that leaves the mailbox |
+| `EWS_RECIPIENT_ALLOWLIST` | | Comma-separated globs; if set, every recipient must match one |
+| `EWS_RECIPIENT_DENYLIST` | | Comma-separated globs; matching recipients are always refused |
+| `SEND_CONFIRM_SECRET` | random per process | HMAC secret for confirm tokens |
+| `CONFIRM_TTL_SECONDS` | `600` | Confirm token lifetime |
+| `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive Exchange failures that open the circuit |
+| `CIRCUIT_OPEN_SECONDS` | `60` | How long EWS calls are refused once open |
+| `WARMUP_MAX_BACKOFF_SECONDS` | `60` | Cap for the startup reconnect backoff |
 | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Bind address |
 | `MCP_API_KEY` | | If set, every request except `GET /health` needs `Authorization: Bearer <key>` |
 | `LOG_LEVEL` | `INFO` | |
@@ -90,32 +98,62 @@ list/search tool). Raw EWS ids are accepted too.
 | `create_event` | draft | write | Create an event; inviting attendees needs `SEND_ENABLED` |
 | `update_event` | draft | write | Change subject/time/location/body; notifying attendees needs `SEND_ENABLED` |
 | `update_task` | draft | write | Complete a task and/or set its due date |
-| `send_draft` | full | send | Send an existing draft |
-| `respond_to_event` | full | send | Accept / tentative / decline (sends a reply to the organizer) |
-| `cancel_event` | full | send | Cancel a meeting you organize (sends cancellations) |
-| `set_oof` | full | send | Set out-of-office replies (they go to other people) |
-| `delete_messages` | full | destructive | Bulk (≤ 50) delete; default moves to Deleted Items, `permanent=true` hard-deletes |
+| `send_draft` | full | send | Send an existing draft (two-phase) |
+| `respond_to_event` | full | send | Accept / tentative / decline; sends a reply to the organizer (two-phase) |
+| `cancel_event` | full | send | Cancel a meeting you organize; sends cancellations (two-phase) |
+| `set_oof` | full | send | Set out-of-office replies; they go to other people (two-phase) |
+| `delete_messages` | full | destructive | Bulk (≤ 50) delete; default moves to Deleted Items, `permanent=true` hard-deletes (two-phase) |
 
 Totals: read 15, draft 8 (23 at tier `draft`), full 5 (28 at tier `full`).
 
 Errors come back as MCP tool errors whose text is JSON:
 `{"code": "...", "message": "...", "hint": "..."}` with `code` one of `validation`,
-`not_found`, `tier_blocked`, `kill_switch`, `auth_failed`, `upstream_unavailable`,
-`upstream_error`. Tracebacks never reach the model.
+`not_found`, `tier_blocked`, `kill_switch`, `recipient_blocked`, `confirm_invalid`,
+`auth_failed`, `upstream_unavailable`, `upstream_error` (plus `retry_after_s` where it
+applies). Tracebacks never reach the model.
 
 ## Safety model
 
-1. **Tiers.** `EWS_CAPABILITY_TIER` decides which tools exist at all. The default `draft`
-   can read and prepare, but has no tool that sends or deletes mail.
-2. **Kill-switch.** With `SEND_ENABLED=false` (default) every send-class tool refuses
-   before touching Exchange: `send_draft`, `respond_to_event`, `cancel_event`, `set_oof`.
-   `create_event` / `update_event` check it only when they would notify attendees.
-3. **Recoverable deletes.** `delete_messages` moves to Deleted Items unless `permanent=true`.
+All policy lives in one dispatcher (`registry.dispatch`) that every tool call goes
+through, in this order:
 
-**There is no confirmation step.** Unlike ews-mcp v5 (two-phase, content-bound confirm
-tokens), lite executes send-class and destructive tools as soon as they are called. Only
-run tier `full` with `SEND_ENABLED=true` with a client that asks the user before tool calls,
-and keep the default tier otherwise.
+```
+kill-switch → tier → circuit breaker → startup gate → recipient guard → two-phase confirm → handler
+```
+
+1. **Kill-switch.** With `SEND_ENABLED=false` (default) every send-class tool is refused
+   before anything else, previews included: `send_draft`, `respond_to_event`,
+   `cancel_event`, `set_oof`. `create_event` / `update_event` check it only when they would
+   notify attendees.
+2. **Tiers.** `EWS_CAPABILITY_TIER` decides which tools exist at all. The default `draft`
+   can read and prepare, but has no tool that sends or deletes mail.
+3. **Circuit breaker.** After `CIRCUIT_FAILURE_THRESHOLD` (5) consecutive Exchange failures,
+   EWS calls are refused for `CIRCUIT_OPEN_SECONDS` (60) with `upstream_unavailable` and
+   `retry_after_s`. A success resets the count. Policy and caller errors (`validation`,
+   `not_found`, `kill_switch`, `confirm_invalid` …) do not count.
+4. **Startup gate.** The server starts even when Exchange is unreachable. A background
+   warmup connects with exponential backoff; until it succeeds (`connecting`), EWS tools fail
+   fast with `upstream_unavailable` and a hint to call `get_server_status`, which always
+   works and reports the state (`connecting` / `warm` / `failed` after rejected credentials).
+5. **Recipient guard.** `EWS_RECIPIENT_ALLOWLIST` / `EWS_RECIPIENT_DENYLIST` (comma-separated,
+   case-insensitive globs such as `*@example.com`) are checked on the recipients of
+   `create_draft`, `update_draft`, `create_event` and `update_event`, and on the **draft's own
+   recipients** at `send_draft`. Violations return `recipient_blocked`.
+6. **Two-phase confirm.** `send_draft`, `respond_to_event`, `cancel_event`, `set_oof` and
+   `delete_messages` execute nothing on the first call: they return a preview and a
+   `confirm_token` (HMAC-SHA256, valid `CONFIRM_TTL_SECONDS` = 600, single use). The second
+   call repeats the arguments plus `confirm_token`. For `send_draft` the token binds the
+   draft's subject, sorted to/cc/bcc and body, which are re-read and re-checked at confirm
+   time, so editing the draft after the preview invalidates the token. For the other tools
+   it binds the arguments (e.g. approving a soft delete cannot be reused for
+   `permanent=true`). Bad, expired, reused or stale tokens return `confirm_invalid` with a
+   hint to preview again. The secret comes from `SEND_CONFIRM_SECRET` or is random per process.
+7. **Recoverable deletes.** `delete_messages` moves to Deleted Items unless `permanent=true`.
+
+**Both confirm steps come from the model.** The token proves that a preview was produced
+and nothing changed since, not that a human looked at it. Do not auto-approve the
+send-class and destructive tools in your MCP client: let the client ask you before the
+confirming call.
 
 ## Differences from ews-mcp v5
 
@@ -124,11 +162,12 @@ and keep the default tier otherwise.
 | SQLite mirror, FTS5 search, background sync | dropped | Live EWS only, nothing stored on disk |
 | Arabic normalization in search | dropped | No local index to normalize |
 | Optional semantic search (`find_similar`, pgvector) | dropped | Out of scope |
-| Two-phase confirm, recipient allow/deny lists, send rate cap | dropped | Kept tiers + kill-switch only |
+| Kill-switch, tiers, circuit breaker, startup gate, recipient guard, two-phase confirm | kept | Same order, one dispatcher |
+| Send rate cap (`EWS_MAX_SENDS_PER_HOUR`) | dropped | Minimal |
 | Hash-chained audit log | dropped | Use the server log |
 | Persistent alias store (SQLite) | in-memory | Aliases reset on restart |
 | stdio transport, REST shim, OpenAPI, `/metrics` | Streamable HTTP + `/health` | FastAPI-hosted MCP only |
-| Connection warm-up loop, circuit breaker | lazy connect, reset on auth/network errors | Minimal |
+| Heartbeat re-probe, protocol-cache eviction ladder | dropped | Warmup until first success, then the circuit breaker |
 
 Fixed compared with v5:
 

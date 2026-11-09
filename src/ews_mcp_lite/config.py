@@ -25,12 +25,33 @@ class Settings(BaseSettings):
     # Safety
     ews_capability_tier: Tier = "draft"
     send_enabled: bool = False
+    ews_recipient_allowlist: str = ""  # comma-separated fnmatch globs; empty = allow all
+    ews_recipient_denylist: str = ""
+    send_confirm_secret: str | None = None  # empty = random per process
+    confirm_ttl_seconds: int = 600
+
+    # Reliability
+    circuit_failure_threshold: int = 5
+    circuit_open_seconds: int = 60
+    warmup_max_backoff_seconds: int = 60
 
     # Serving
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8000
     mcp_api_key: str | None = None
     log_level: str = "INFO"
+
+    @staticmethod
+    def _globs(raw: str) -> list[str]:
+        return [g.strip().lower() for g in (raw or "").split(",") if g.strip()]
+
+    @property
+    def allowlist(self) -> list[str]:
+        return self._globs(self.ews_recipient_allowlist)
+
+    @property
+    def denylist(self) -> list[str]:
+        return self._globs(self.ews_recipient_denylist)
 
     def tier_allows(self, tier: str) -> bool:
         return TIER_RANK[tier] <= TIER_RANK[self.ews_capability_tier]

@@ -11,7 +11,7 @@ from exchangelib.properties import ConversationId
 from pydantic import Field
 
 from ..dates import parse_when
-from ..dto import msg_card, msg_full, page
+from ..dto import body_text, msg_card, msg_full, page
 from ..errors import Failure
 from ..registry import Registry
 from .common import check_page, fetch_one, mailboxes, resolve_folder, resolve_many, take
@@ -426,32 +426,57 @@ def register(r: Registry) -> None:
 
     # ------------------------------------------------------------------ full tier
 
-    @r.tool("full", "send")
+    def _draft_content(account, raw: str) -> tuple[Any, dict[str, Any]]:
+        draft = fetch_one(account, raw)
+        if not getattr(draft, "is_draft", False):
+            raise Failure("validation", "that item is not a draft")
+
+        def addrs(field):
+            return sorted((m.email_address or "").lower() for m in (getattr(draft, field, None) or []))
+        content = {"subject": draft.subject or "", "to": addrs("to_recipients"),
+                   "cc": addrs("cc_recipients"), "bcc": addrs("bcc_recipients"), "body": body_text(draft)}
+        return draft, content
+
+    async def resolve_send_draft(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Bind the confirm token to the draft's CONTENT, re-read at both phases."""
+        raw, _ = ctx.aliases.resolve(kwargs["draft_id"], expect=("d", "m"))
+        _, content = await ctx.gateway.call(lambda account: _draft_content(account, raw))
+        recipients = content["to"] + content["cc"] + content["bcc"]
+        if not recipients:
+            raise Failure("validation", "the draft has no recipients")
+        preview = {**{k: content[k] for k in ("subject", "to", "cc", "bcc")},
+                   "body_snippet": content["body"][:400], "draft_id": kwargs["draft_id"]}
+        return {"preview": preview, "material": content, "recipients": recipients}
+
+    @r.tool("full", "send", resolve=resolve_send_draft)
     async def send_draft(draft_id: Annotated[str, Field(description="Draft id (d1).")]) -> dict[str, Any]:
         """SEND an existing draft (the only way mail leaves the mailbox). Refused while
-        SEND_ENABLED=false. There is no confirmation step: only call this after the user
-        approved the draft."""
+        SEND_ENABLED=false. The confirm token binds the draft's subject, recipients and body:
+        editing the draft after the preview invalidates it."""
         raw, _ = ctx.aliases.resolve(draft_id, expect=("d", "m"))
 
         def work(account):
-            draft = fetch_one(account, raw)
-            if not getattr(draft, "is_draft", False):
-                raise Failure("validation", "that item is not a draft")
-            rcpts = [m.email_address for m in (draft.to_recipients or []) + (draft.cc_recipients or [])
-                     + (draft.bcc_recipients or [])]
-            if not rcpts:
-                raise Failure("validation", "the draft has no recipients")
+            draft, content = _draft_content(account, raw)
             draft.send(save_copy=True)
-            return {"sent": True, "recipients": rcpts, "subject": draft.subject}
+            return {"sent": True, "recipients": content["to"] + content["cc"] + content["bcc"],
+                    "subject": content["subject"]}
         return await ctx.gateway.call(work)
 
-    @r.tool("full", "destructive")
+    async def resolve_delete(kwargs: dict[str, Any]) -> dict[str, Any]:
+        refs = resolve_many(ctx.aliases, kwargs["ids"], ("m", "d"))  # validates before any preview
+        permanent = bool(kwargs.get("permanent", False))
+        return {"preview": {"ids": [ref for ref, _ in refs], "count": len(refs), "permanent": permanent,
+                            "recoverable": not permanent},
+                "material": {"raw_ids": sorted(raw for _, raw in refs), "permanent": permanent},
+                "recipients": []}
+
+    @r.tool("full", "destructive", resolve=resolve_delete)
     async def delete_messages(
         ids: Annotated[list[str], Field(description="Up to 50 message ids.")],
         permanent: Annotated[bool, Field(description="true = hard delete (NOT recoverable). Default moves to Deleted Items.")] = False,
     ) -> dict[str, Any]:
         """Delete messages. Default: move to Deleted Items (recoverable). permanent=true
-        deletes for good. There is no confirmation step."""
+        deletes for good."""
         refs = resolve_many(ctx.aliases, ids, ("m", "d"))
 
         def work(account):

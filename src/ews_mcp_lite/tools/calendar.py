@@ -221,7 +221,7 @@ def register(r: Registry) -> None:
         message: str | None = None,
     ) -> dict[str, Any]:
         """Cancel a meeting you organize: SENDS cancellations to all attendees and removes
-        it from your calendar (refused while SEND_ENABLED=false). No confirmation step."""
+        it from your calendar (refused while SEND_ENABLED=false)."""
         raw, _ = ctx.aliases.resolve(event_id, expect=("e",))
 
         def work(account):

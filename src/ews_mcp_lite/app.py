@@ -9,6 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -24,8 +25,9 @@ INSTRUCTIONS = (
     "Live Microsoft Exchange (EWS) mailbox access. Ids are short aliases (m1 message, d1 draft, "
     "e1 event, f1 folder, p1 person, k1 task, t1 thread): pass them back exactly. Aliases are "
     "lost when the server restarts; re-run the list/search tool if one is reported stale. "
-    "Errors are JSON with a code and a hint. Sending is only possible at tier 'full' with "
-    "SEND_ENABLED=true and there is no confirmation step, so get the user's approval first."
+    "Errors are JSON with a code and a hint. Send-class and destructive tools are two-phase: the "
+    "first call only returns a preview and a confirm_token; show the preview to the user and call "
+    "again with confirm_token only after they approve."
 )
 
 
@@ -46,8 +48,11 @@ def build_app(settings: Settings | None = None, gateway: Gateway | None = None) 
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with mcp.session_manager.run():
-            yield
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(ctx.gateway.warmup)  # never blocks startup; Exchange may be down
+            async with mcp.session_manager.run():
+                yield
+            tg.cancel_scope.cancel()
 
     app = FastAPI(title="ews-mcp-lite", version=__version__, lifespan=lifespan,
                   docs_url=None, redoc_url=None)

@@ -187,7 +187,7 @@ def register(r: Registry) -> None:
         end: str | None = None,
     ) -> dict[str, Any]:
         """Set out-of-office auto-replies. Replies go to OTHER people, so this is
-        send-class (refused while SEND_ENABLED=false). No confirmation step."""
+        send-class (refused while SEND_ENABLED=false)."""
         if state != "disabled" and not internal_reply:
             raise Failure("validation", "internal_reply is required unless state='disabled'")
         if state == "scheduled" and not (start and end):
@@ -206,7 +206,7 @@ def register(r: Registry) -> None:
             return {"state": state, "external_audience": external_audience}
         return await ctx.gateway.call(work)
 
-    @r.tool("read", "read")
+    @r.tool("read", "read", needs_ews=False)
     async def get_server_status(
         probe: Annotated[bool, Field(description="true = make a live EWS round trip to test the connection.")] = False,
     ) -> dict[str, Any]:

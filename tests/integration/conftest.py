@@ -61,7 +61,9 @@ def anyio_backend():
 
 @pytest.fixture(scope="session")
 def gateway() -> Gateway:
-    return Gateway(settings())
+    gw = Gateway(settings())
+    assert gw.connect(), f"cannot reach {URL}: {gw.last_error}"
+    return gw
 
 
 @pytest.fixture

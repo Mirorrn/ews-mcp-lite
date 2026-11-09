@@ -27,6 +27,7 @@ class FakeGateway(Gateway):
         self.mock_account = MagicMock(name="account")
         self.mock_account.version = EXCHANGE_2016
         self.calls = 0
+        self.state = "warm"  # unit tests start past the startup gate
 
     def account(self):
         self.calls += 1
@@ -58,3 +59,12 @@ async def call(mcp, name: str, args: dict[str, Any] | None = None) -> tuple[bool
         text = res.content[0].text
         return False, json.loads(text[text.index("{"):])
     return True, res.structured_content
+
+
+async def confirmed(mcp, name: str, args: dict[str, Any]) -> Any:
+    """Two-phase helper: preview, then confirm with the issued token."""
+    ok, preview = await call(mcp, name, args)
+    assert ok and preview["requires_confirmation"], preview
+    ok, res = await call(mcp, name, {**args, "confirm_token": preview["confirm_token"]})
+    assert ok, res
+    return res

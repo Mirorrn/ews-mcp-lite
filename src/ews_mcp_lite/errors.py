@@ -8,6 +8,8 @@ CODES = (
     "not_found",
     "tier_blocked",
     "kill_switch",
+    "recipient_blocked",
+    "confirm_invalid",
     "auth_failed",
     "upstream_unavailable",
     "upstream_error",
@@ -15,17 +17,21 @@ CODES = (
 
 
 class Failure(Exception):
-    def __init__(self, code: str, message: str, hint: str | None = None):
+    def __init__(self, code: str, message: str, hint: str | None = None,
+                 retry_after_s: int | None = None):
         assert code in CODES, code
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
+        self.retry_after_s = retry_after_s
 
     def to_json(self) -> str:
-        body = {"code": self.code, "message": self.message}
+        body: dict = {"code": self.code, "message": self.message}
         if self.hint:
             body["hint"] = self.hint
+        if self.retry_after_s is not None:
+            body["retry_after_s"] = self.retry_after_s
         return json.dumps(body, ensure_ascii=False)
 
 

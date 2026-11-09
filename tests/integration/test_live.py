@@ -8,7 +8,7 @@ from exchangelib import Attendee, CalendarItem, Mailbox, Q, Task
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, MeetingRequest
 
 from ews_mcp_lite.app import build_server
-from tests.conftest import call
+from tests.conftest import call, confirmed
 from tests.integration.conftest import PEER, USER, settings, wait_for
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
@@ -113,17 +113,17 @@ async def test_move_and_soft_then_permanent_delete(server, mark, me):
     b = await ok(server, "create_draft", {"to": ["x@example.com"], "subject": f"{mark} del-b", "body": "b"})
     moved = await ok(server, "move_messages", {"ids": [a["draft_id"]], "to_folder": "trash"})
     assert moved["moved"] == [a["draft_id"]]
-    soft = await ok(server, "delete_messages", {"ids": [b["draft_id"]]})
+    soft = await confirmed(server, "delete_messages", {"ids": [b["draft_id"]]})
     assert soft["recoverable"] is True
     assert wait_for(lambda: list(me.trash.filter(subject=f"{mark} del-b").only("id")))
-    hard = await ok(server, "delete_messages", {"ids": [a["draft_id"]], "permanent": True})
+    hard = await confirmed(server, "delete_messages", {"ids": [a["draft_id"]], "permanent": True})
     assert hard["recoverable"] is False and hard["deleted"]
     assert not list(me.trash.filter(subject=f"{mark} del-a").only("id"))
 
 
 async def test_send_draft_reaches_peer(server, mark, peer):
     d = await ok(server, "create_draft", {"to": [PEER], "subject": f"{mark} send", "body": "hello"})
-    sent = await ok(server, "send_draft", {"draft_id": d["draft_id"]})
+    sent = await confirmed(server, "send_draft", {"draft_id": d["draft_id"]})
     assert sent["sent"] is True
     assert wait_for(lambda: list(peer.inbox.filter(subject=f"{mark} send").only("id")))
 
@@ -152,7 +152,7 @@ async def test_plain_event_lifecycle(server, mark):
     await ok(server, "update_event", {"event_id": ev["event_id"], "location": "Room 2"})
     full = await ok(server, "get_event", {"id": ev["event_id"]})
     assert full["event"]["location"] == "Room 2"
-    res = await ok(server, "cancel_event", {"event_id": ev["event_id"]})
+    res = await confirmed(server, "cancel_event", {"event_id": ev["event_id"]})
     assert res["cancelled"] and res["cancellations_sent"] is False
 
 
@@ -172,7 +172,7 @@ async def test_meeting_invite_accept_cancel(server, mark, peer):
             break
         await anyio.sleep(1)
     assert any(p["email"] == PEER for p in (full["event"]["attendees"] or []))
-    res = await ok(server, "cancel_event", {"event_id": ev["event_id"], "message": "cancelled by test"})
+    res = await confirmed(server, "cancel_event", {"event_id": ev["event_id"], "message": "cancelled by test"})
     assert res["cancellations_sent"] is True
     assert wait_for(lambda: list(peer.inbox.filter(Q(subject__icontains=mark) & Q(subject__icontains="meeting"))
                                  .only("subject")))
@@ -195,7 +195,7 @@ async def test_respond_to_peer_invite(server, mark, peer):
             break
         await anyio.sleep(1)
     assert events, "invite never showed up in the calendar"
-    res = await ok(server, "respond_to_event", {"event_id": events[0]["id"], "response": "accept"})
+    res = await confirmed(server, "respond_to_event", {"event_id": events[0]["id"], "response": "accept"})
     assert res["responded"] == "accept"
 
 
@@ -215,10 +215,63 @@ async def test_update_task(server, mark, me):
 async def test_oof_roundtrip(server):
     before = await ok(server, "get_oof_settings")
     try:
-        await ok(server, "set_oof", {"state": "enabled", "internal_reply": "Away (integration test)"})
+        await confirmed(server, "set_oof", {"state": "enabled", "internal_reply": "Away (integration test)"})
         now = await ok(server, "get_oof_settings")
         assert now["state"] == "enabled" and "Away" in now["internal_reply"]
     finally:
-        await ok(server, "set_oof", {"state": "disabled"})
+        await confirmed(server, "set_oof", {"state": "disabled"})
     after = await ok(server, "get_oof_settings")
     assert after["state"] == "disabled" or before["state"] != "disabled"
+
+
+# ------------------------------------------------------------------ two-phase confirm, live
+
+
+async def test_send_draft_confirm_flow_exactly_one_mail(server, mark, peer):
+    subject = f"{mark} confirm-send"
+    d = await ok(server, "create_draft", {"to": [PEER], "subject": subject, "body": "approved text"})
+    preview = await ok(server, "send_draft", {"draft_id": d["draft_id"]})
+    assert preview["requires_confirmation"] and preview["preview"]["to"] == [PEER]
+    assert preview["preview"]["subject"] == subject
+    # nothing was sent by the preview
+    assert not wait_for(lambda: list(peer.inbox.filter(subject=subject).only("id")), timeout=4)
+    token = preview["confirm_token"]
+    sent = await ok(server, "send_draft", {"draft_id": d["draft_id"], "confirm_token": token})
+    assert sent["sent"] is True
+    good, err = await call(server, "send_draft", {"draft_id": d["draft_id"], "confirm_token": token})
+    assert not good and err["code"] == "confirm_invalid" and "already used" in err["message"]
+    assert wait_for(lambda: list(peer.inbox.filter(subject=subject).only("id")))
+    await anyio.sleep(3)
+    assert len(list(peer.inbox.filter(subject=subject).only("id"))) == 1, "peer must get exactly one mail"
+
+
+async def test_send_draft_token_dies_when_draft_is_edited(server, mark, peer):
+    subject = f"{mark} confirm-edit"
+    d = await ok(server, "create_draft", {"to": [PEER], "subject": subject, "body": "version 1"})
+    preview = await ok(server, "send_draft", {"draft_id": d["draft_id"]})
+    await ok(server, "update_draft", {"draft_id": d["draft_id"], "body": "version 2"})
+    good, err = await call(server, "send_draft", {"draft_id": d["draft_id"],
+                                                  "confirm_token": preview["confirm_token"]})
+    assert not good and err["code"] == "confirm_invalid"
+    assert not wait_for(lambda: list(peer.inbox.filter(subject=subject).only("id")), timeout=4)
+
+
+async def test_delete_messages_confirm_flow(server, mark, me):
+    subject = f"{mark} confirm-delete"
+    d = await ok(server, "create_draft", {"to": ["x@example.com"], "subject": subject, "body": "x"})
+    preview = await ok(server, "delete_messages", {"ids": [d["draft_id"]]})
+    assert preview["requires_confirmation"] and preview["preview"]["recoverable"] is True
+    assert list(me.drafts.filter(subject=subject).only("id")), "preview must not delete"
+    token = preview["confirm_token"]
+    res = await ok(server, "delete_messages", {"ids": [d["draft_id"]], "confirm_token": token})
+    assert res["deleted"] == [d["draft_id"]]
+    assert wait_for(lambda: list(me.trash.filter(subject=subject).only("id")))
+    good, err = await call(server, "delete_messages", {"ids": [d["draft_id"]], "confirm_token": token})
+    assert not good and err["code"] == "confirm_invalid"
+
+
+async def test_recipient_guard_live(gateway, mark):
+    mcp, _ = build_server(settings(ews_recipient_allowlist="*@grommunio.test"), gateway)
+    good, err = await call(mcp, "create_draft", {"to": ["someone@example.com"], "subject": f"{mark} rg",
+                                                "body": "x"})
+    assert not good and err["code"] == "recipient_blocked"

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tests.conftest import call
+from tests.conftest import call, confirmed
 
 pytestmark = pytest.mark.anyio
 
@@ -73,8 +73,8 @@ def _fake_item(account):
 async def test_delete_messages_defaults_to_recoverable_move(server_factory):
     mcp, _, gw = server_factory(ews_capability_tier="full", send_enabled=False)
     item = _fake_item(gw.mock_account)
-    ok, res = await call(mcp, "delete_messages", {"ids": ["AAMkRAWMESSAGE"]})
-    assert ok and res["recoverable"] is True and res["deleted"] == ["AAMkRAWMESSAGE"]
+    res = await confirmed(mcp, "delete_messages", {"ids": ["AAMkRAWMESSAGE"]})
+    assert res["recoverable"] is True and res["deleted"] == ["AAMkRAWMESSAGE"]
     item.move_to_trash.assert_called_once()
     item.delete.assert_not_called()
 
@@ -82,27 +82,34 @@ async def test_delete_messages_defaults_to_recoverable_move(server_factory):
 async def test_delete_messages_permanent_is_explicit(server_factory):
     mcp, _, gw = server_factory(ews_capability_tier="full")
     item = _fake_item(gw.mock_account)
-    ok, res = await call(mcp, "delete_messages", {"ids": ["AAMkRAWMESSAGE"], "permanent": True})
-    assert ok and res["recoverable"] is False
+    res = await confirmed(mcp, "delete_messages", {"ids": ["AAMkRAWMESSAGE"], "permanent": True})
+    assert res["recoverable"] is False
     item.delete.assert_called_once()
     item.move_to_trash.assert_not_called()
 
 
-async def test_delete_messages_caps_bulk(server_factory):
+async def test_delete_messages_caps_bulk_before_preview(server_factory):
     mcp, _, _ = server_factory(ews_capability_tier="full")
     ok, err = await call(mcp, "delete_messages", {"ids": [f"AAMk{i}" for i in range(51)]})
     assert not ok and err["code"] == "validation"
 
 
+def _draft(account, to=("a@example.com",), body="Hello", subject="Hi"):
+    item = MagicMock(name="draft")
+    item.is_draft = True
+    item.subject = subject
+    item.to_recipients = [MagicMock(email_address=a) for a in to]
+    item.cc_recipients = item.bcc_recipients = None
+    item.text_body = body
+    account.fetch.return_value = [item]
+    return item
+
+
 async def test_send_draft_allowed_when_enabled(server_factory):
     mcp, _, gw = server_factory(ews_capability_tier="full", send_enabled=True)
-    item = _fake_item(gw.mock_account)
-    item.is_draft = True
-    item.to_recipients = [MagicMock(email_address="a@example.com")]
-    item.cc_recipients = item.bcc_recipients = None
-    item.subject = "Hi"
-    ok, res = await call(mcp, "send_draft", {"draft_id": "AAMkRAWDRAFTID"})
-    assert ok and res["sent"] is True
+    item = _draft(gw.mock_account)
+    res = await confirmed(mcp, "send_draft", {"draft_id": "AAMkRAWDRAFTID"})
+    assert res["sent"] is True
     item.send.assert_called_once_with(save_copy=True)
 
 
