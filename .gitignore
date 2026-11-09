@@ -1,0 +1,25 @@
+# Python / uv
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+
+# caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# local config and secrets
+.env
+*.local.env
+
+# grommunio dev stack checkout (dev/grommunio/setup.sh)
+dev/grommunio/.work/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

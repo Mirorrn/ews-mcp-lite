@@ -1,0 +1,42 @@
+[project]
+name = "ews-mcp-lite"
+version = "0.1.0"
+description = "Minimal MCP server for Microsoft Exchange (EWS): FastAPI + the official MCP SDK, live EWS, no cache."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+keywords = ["mcp", "exchange", "ews", "fastapi", "model-context-protocol"]
+dependencies = [
+    "exchangelib==5.0.3",
+    "fastapi>=0.162.2",
+    "mcp>=2.3,<3",
+    "pydantic-settings>=2.16.2",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+ews-mcp-lite = "ews_mcp_lite.app:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs a live EWS server (set EWS_IT_URL)"]
+addopts = "-m 'not integration'"
