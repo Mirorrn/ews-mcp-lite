@@ -23,3 +23,7 @@ dev/grommunio/.work/
 .DS_Store
 .idea/
 .vscode/
+
+# realistic seed output and agentic test runs
+dev/grommunio/seed_manifest.json
+tests/agentic/runs/

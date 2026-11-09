@@ -38,5 +38,8 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: needs a live EWS server (set EWS_IT_URL)"]
-addopts = "-m 'not integration'"
+markers = [
+    "integration: needs a live EWS server (set EWS_IT_URL)",
+    "agentic: drives Claude Code headless against the local grommunio stack (set EWS_AGENTIC=1; costs tokens)",
+]
+addopts = "-m 'not integration and not agentic'"
