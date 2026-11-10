@@ -1,4 +1,4 @@
-"""Aliases, DTOs, dates, the exchangelib compat shim and the v5 bug fixes."""
+"""Aliases, DTOs, dates, the exchangelib compat shim and server workarounds."""
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -100,7 +100,7 @@ def test_compat_parses_fractional_seconds():
     assert _EDT.from_string("2026-11-09T08:28:05Z").second == 5
 
 
-# ---------------------------------------------------------------- v5 bug fixes
+# ---------------------------------------------------------------- server workarounds
 
 
 def test_fetch_event_retries_without_attendee_fields():
@@ -136,7 +136,7 @@ async def test_get_event_marks_attendees_unavailable(server_factory):
 
 @pytest.mark.anyio
 async def test_check_availability_passes_ews_timezone_datetimes(server_factory):
-    """v5 passed zoneinfo datetimes -> AttributeError 'ms_id' inside exchangelib.
+    """zoneinfo datetimes would raise AttributeError 'ms_id' inside exchangelib.
     The mock must capture the real arguments, not just return canned data."""
     mcp, _, gw = server_factory()
     captured = {}
@@ -158,13 +158,13 @@ async def test_check_availability_passes_ews_timezone_datetimes(server_factory):
 
 @pytest.mark.anyio
 async def test_search_falls_back_to_subject_when_body_restriction_rejected(server_factory):
-    mcp, _, gw = server_factory()
+    mcp, _, gw = server_factory(ews_search_mode="restriction")
     err_cls = type("ErrorInvalidRestriction", (Exception,), {})
     folder = gw.mock_account.inbox
     good = MagicMock()
     good.order_by.return_value.only.return_value = iter([])
     bad = MagicMock()
     bad.order_by.return_value.only.return_value.__iter__.side_effect = err_cls("E-3224")
-    folder.filter.side_effect = [bad, good]
+    folder.filter.side_effect = [bad, bad, good]  # item:Body, then PR_BODY rejected
     ok, res = await call(mcp, "search_messages", {"query": "budget"})
     assert ok and "subjects only" in res["note"]

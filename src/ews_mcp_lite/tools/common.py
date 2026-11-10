@@ -4,9 +4,12 @@ from itertools import islice
 from typing import Any
 
 from exchangelib import CalendarItem, Mailbox
+from exchangelib.folders import Folder
 from exchangelib.properties import ItemId
+from exchangelib.queryset import QuerySet
 
 from ..aliases import AliasStore, is_alias
+from ..compat import fields_without_pr_body
 from ..errors import Failure, classify
 
 MAX_LIMIT = 100
@@ -28,9 +31,17 @@ def check_page(offset: int, limit: int) -> tuple[int, int]:
     return offset, limit
 
 
+def window(iterable, start: int, stop: int) -> list[Any]:
+    """iterable[start:stop] as a list; QuerySets page server-side instead of
+    iterating (and fetching) everything before `start`."""
+    if isinstance(iterable, QuerySet):
+        return list(iterable[start:stop])
+    return list(islice(iterable, start, stop))
+
+
 def take(iterable, offset: int, limit: int) -> tuple[list[Any], bool]:
     """Slice offset..offset+limit with one item of look-ahead."""
-    rows = list(islice(iterable, offset, offset + limit + 1))
+    rows = window(iterable, offset, offset + limit + 1)
     return rows[:limit], len(rows) > limit
 
 
@@ -62,10 +73,21 @@ def _folder_by_id(account: Any, raw: str) -> Any:
     raise Failure("not_found", "Folder id not found.", "Use list_folders to get fresh ids.")
 
 
+_FULL_FIELDS: dict[Any, list[Any]] = {}
+
+
+def full_fields(account: Any) -> list[Any]:
+    """What a fetch without only_fields would request (all item types), minus pr_body."""
+    v = account.version
+    key = (v.build, v.api_version)
+    if key not in _FULL_FIELDS:
+        _FULL_FIELDS[key] = fields_without_pr_body(Folder.allowed_item_fields(version=v))
+    return _FULL_FIELDS[key]
+
+
 def fetch_one(account: Any, raw_id: str, only: list[str] | None = None, folder: Any = None) -> Any:
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {"only_fields": only or full_fields(account)}
     if only:
-        kwargs["only_fields"] = only
         kwargs["folder"] = folder if folder is not None else account.inbox
     res = list(account.fetch(ids=[ItemId(id=raw_id)], **kwargs))
     if not res or res[0] is None:

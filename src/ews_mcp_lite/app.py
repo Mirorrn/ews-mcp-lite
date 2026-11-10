@@ -40,6 +40,7 @@ DOCS_DESCRIPTION = (
 PUBLIC_PATHS = frozenset({"/health", "/docs", "/docs/oauth2-redirect", "/openapi.json"})
 
 
+logger = logging.getLogger(__name__)
 def build_server(settings: Settings, gateway: Gateway | None = None) -> tuple[MCPServer, Context]:
     ctx = Context(settings=settings, gateway=gateway or Gateway(settings))
     registry = Registry(ctx)
@@ -53,6 +54,10 @@ def build_server(settings: Settings, gateway: Gateway | None = None) -> tuple[MC
 def build_app(settings: Settings | None = None, gateway: Gateway | None = None) -> FastAPI:
     settings = settings or Settings()
     mcp, ctx = build_server(settings, gateway)
+    logger.info("search config: EWS_SERVER_TYPE=%s, free-text search=%s%s, body fields=%s",
+                settings.ews_server_type, settings.search_mode,
+                " (EWS_SEARCH_MODE override)" if settings.ews_search_mode else "",
+                "/".join(settings.body_fields))
     mcp_app = mcp.streamable_http_app(host=settings.mcp_host)  # creates mcp.session_manager
 
     @asynccontextmanager

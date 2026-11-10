@@ -214,7 +214,10 @@ def register(r: Registry) -> None:
         out: dict[str, Any] = {"version": __version__, "tier": ctx.settings.ews_capability_tier,
                                "send_enabled": ctx.settings.send_enabled,
                                "tools": len(ctx.registered), "tool_names": ctx.registered,
-                               "call_counts": dict(ctx.counters), "aliases": ctx.aliases.stats()}
+                               "call_counts": dict(ctx.counters), "aliases": ctx.aliases.stats(),
+                               "search": {"server_type": ctx.settings.ews_server_type,
+                                          "mode": ctx.settings.search_mode,
+                                          "body_fields": list(ctx.settings.body_fields)}}
         if probe:
             def work(account):
                 account.inbox.refresh()

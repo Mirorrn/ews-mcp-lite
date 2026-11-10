@@ -1,15 +1,16 @@
 """End-to-end tool tests against a live EWS server (see conftest for setup)."""
 
 import datetime as dt
+import uuid
 
 import anyio
 import pytest
-from exchangelib import Attendee, CalendarItem, Mailbox, Q, Task
+from exchangelib import Attendee, CalendarItem, HTMLBody, Mailbox, Message, Q, Task
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, MeetingRequest
 
 from ews_mcp_lite.app import build_server
 from tests.conftest import call, confirmed
-from tests.integration.conftest import PEER, USER, settings, wait_for
+from tests.integration.conftest import PEER, SERVER_TYPE, USER, settings, wait_for
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
@@ -49,6 +50,48 @@ async def test_folders_search_message_attachment(server):
     thread = await ok(server, "get_thread", {"id": first["id"]})
     assert thread["count"] >= 1
 
+
+async def test_search_follows_server_type(gateway):
+    """EWS_IT_SERVER_TYPE must match the server: a nonsense term finds nothing (on
+    grommunio AQS would return the whole folder), and a subject word finds its message."""
+    mcp, ctx = build_server(settings(), gateway)
+    none = await ok(mcp, "search_messages", {"query": f"zz{uuid.uuid4().hex}"})
+    assert none["count"] == 0, f"unfiltered results: is EWS_IT_SERVER_TYPE={SERVER_TYPE} right?"
+    assert ("search index" in none.get("note", "")) is (ctx.settings.search_mode == "aqs")
+    newest = await ok(mcp, "search_messages", {"limit": 1})
+    words = [w for w in newest["items"][0]["subject"].split() if len(w) > 3 and w.isalnum()] if newest["items"] else []
+    if words:
+        hit = await ok(mcp, "search_messages", {"query": words[0], "limit": 100})
+        assert any(c["id"] == newest["items"][0]["id"] for c in hit["items"])
+
+
+async def test_search_finds_body_only_terms(gateway):
+    """'pre-approval' is only in the seeded body of 'FYI: new expense policy'
+    (grommunio: via the PR_BODY fallback, not 'subjects only')."""
+    mcp, _ = build_server(settings(), gateway)
+    hit = await ok(mcp, "search_messages", {"query": "pre-approval"})
+    assert any(c["subject"] == "FYI: new expense policy" for c in hit["items"]), hit
+    assert "subjects only" not in hit.get("note", "")
+    none = await ok(mcp, "search_messages", {"query": f"zz{uuid.uuid4().hex}"})
+    assert none["count"] == 0
+
+
+async def test_search_html_only_bodies(gateway, mark, me, peer):
+    """Delivered HTML-only mail is found by body. On grommunio, an HTML-only item
+    created via EWS (no SMTP delivery) gets no PR_BODY, so its body is not searchable."""
+    mcp, _ = build_server(settings(), gateway)
+    sent_word, saved_word = f"zx{uuid.uuid4().hex[:10]}", f"zx{uuid.uuid4().hex[:10]}"
+    Message(account=peer, subject=f"{mark} html sent", body=HTMLBody(f"<p>Hi <b>{sent_word}</b></p>"),
+            to_recipients=[Mailbox(email_address=USER)]).send(save_copy=False)
+    Message(account=me, folder=me.drafts, subject=f"{mark} html saved",
+            body=HTMLBody(f"<p>Hi <b>{saved_word}</b></p>")).save()
+    assert wait_for(lambda: list(me.inbox.filter(subject=f"{mark} html sent").only("id")))
+    hit = await ok(mcp, "search_messages", {"query": sent_word})
+    assert [c["subject"] for c in hit["items"]] == [f"{mark} html sent"], hit
+    saved = await ok(mcp, "search_messages", {"query": saved_word, "folder": "drafts"})
+    if not saved["items"]:
+        pytest.xfail("server keeps no plain-text body (PR_BODY) for HTML-only items saved via EWS")
+    assert [c["subject"] for c in saved["items"]] == [f"{mark} html saved"]
 
 async def test_overview_tasks_oof_waiting(server):
     ov = await ok(server, "get_mailbox_overview")

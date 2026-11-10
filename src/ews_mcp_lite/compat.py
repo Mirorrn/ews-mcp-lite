@@ -6,17 +6,28 @@
 field come back as ``None`` (DateTimeReceived, LastModifiedTime, OOF windows).
 This patch accepts any number of fractional digits; plain ``…SSZ`` values and
 offset-style values keep the original code path.
+
+``pr_body`` (MAPI PR_BODY, 0x1000) is registered on Message so restrictions can
+search the plain-text body on servers that reject Contains on ``item:Body``
+(grommunio, E-3224). Full fetches must leave it out (``fields_without_pr_body``),
+or the body is downloaded twice.
 """
 
 import datetime
 import re
 
-from exchangelib import UTC
+from exchangelib import UTC, ExtendedProperty, Message
 from exchangelib.ewsdatetime import EWSDateTime
 
 _FRACTIONAL_UTC = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d+)Z$")
 _original = EWSDateTime.from_string.__func__
 _applied = False
+PR_BODY = "pr_body"
+
+
+class PrBody(ExtendedProperty):
+    property_tag = 0x1000
+    property_type = "String"
 
 
 def _from_string(cls, date_string):
@@ -33,3 +44,9 @@ def apply() -> None:
     if not _applied:
         EWSDateTime.from_string = classmethod(_from_string)
         _applied = True
+    if not any(f.name == PR_BODY for f in Message.FIELDS):  # register() raises on a second call
+        Message.register(PR_BODY, PrBody)
+
+
+def fields_without_pr_body(fields) -> list:
+    return [f for f in fields if f.name != PR_BODY]

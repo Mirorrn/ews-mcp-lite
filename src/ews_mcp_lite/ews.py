@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 CONNECTING, WARM, FAILED = "connecting", "warm", "failed"
+GROMOX_DEFAULT_BUILD = "15.0.847.4040"  # gromox ews.cfg reported_server_version default
 
 
 class Gateway:
@@ -101,14 +102,21 @@ class Gateway:
         """One blocking connection attempt (a real round trip). Updates state."""
         self.attempts += 1
         try:
-            self._execute(lambda account: account.inbox.refresh())
+            version = self._execute(lambda account: (account.inbox.refresh(), account.version)[1])
         except Failure as f:
             if f.code == "auth_failed":
                 self.state = FAILED
             logger.warning("EWS connect attempt %d failed: %s", self.attempts, f.message)
             return False
         self.state = WARM
-        logger.info("EWS connection is warm")
+        build = str(getattr(version, "build", "?"))
+        s = self.settings
+        logger.info("EWS connection is warm (server build %s, api %s; EWS_SERVER_TYPE=%s, search=%s)",
+                    build, getattr(version, "api_version", "?"), s.ews_server_type, s.search_mode)
+        if build == GROMOX_DEFAULT_BUILD and s.ews_server_type != "grommunio":
+            logger.warning("server reports build %s, the gromox (grommunio) default, but "
+                           "EWS_SERVER_TYPE=%s: AQS search would return unfiltered results there. "
+                           "Set EWS_SERVER_TYPE=grommunio if this is grommunio.", build, s.ews_server_type)
         return True
 
     async def warmup(self) -> None:

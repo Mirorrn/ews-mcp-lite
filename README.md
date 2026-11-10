@@ -6,13 +6,10 @@ people, tasks, drafts and (explicitly enabled) sending.
 
 - **FastAPI** host with the **official MCP Python SDK** (Streamable HTTP) mounted at `/mcp`
 - **Live EWS only**: no cache, no database, no background sync
-- **28 tools** in three capability tiers, with v5's safety chain: kill-switch, circuit breaker,
+- **28 tools** in three capability tiers, with a safety chain: kill-switch, circuit breaker,
   startup gate, recipient guard and two-phase confirmation
 - Short id aliases (`m1`, `e2`, `d3` …) and compact result cards instead of raw EWS ids and HTML
 - Built with **uv**; Python 3.13+
-
-It is a slimmed-down sibling of [ews-mcp](https://github.com/azizmazrou/ews-mcp) (v5 /
-release line 4.5). See [Differences from ews-mcp v5](#differences-from-ews-mcp-v5).
 
 ## Quick start
 
@@ -46,6 +43,8 @@ Environment variables (or a `.env` file in the working directory). See [.env.exa
 | `EWS_PASSWORD` | | Password |
 | `EWS_INSECURE_SKIP_VERIFY` | `false` | Skip TLS verification (test servers only) |
 | `EWS_TZ` | `UTC` | IANA timezone for `today`, `+1d`, naive times and rendered dates |
+| `EWS_SERVER_TYPE` | `exchange` | What the EWS server is: `exchange` or `grommunio`. Sets search behaviour up front, nothing is probed at runtime: `exchange` = AQS via the search index, body search on `item:Body`; `grommunio` = restrictions only, body search on PR_BODY |
+| `EWS_SEARCH_MODE` | *(empty)* | Optional override of the free-text search path: `aqs` (EWS `QueryString`) or `restriction` (subject/body contains). Empty = from `EWS_SERVER_TYPE`. `aqs` with `grommunio` is refused at startup |
 | `EWS_CAPABILITY_TIER` | `draft` | `read`, `draft` or `full`; tools above the tier are not registered |
 | `SEND_ENABLED` | `false` | Kill-switch for everything that leaves the mailbox |
 | `EWS_RECIPIENT_ALLOWLIST` | | Comma-separated globs; if set, every recipient of outgoing mail must match one (drafts are not checked until sent) |
@@ -157,32 +156,38 @@ and nothing changed since, not that a human looked at it. Do not auto-approve th
 send-class and destructive tools in your MCP client: let the client ask you before the
 confirming call.
 
-## Differences from ews-mcp v5
+## Server compatibility
 
-| v5 feature | lite | Why |
-|---|---|---|
-| SQLite mirror, FTS5 search, background sync | dropped | Live EWS only, nothing stored on disk |
-| Arabic normalization in search | dropped | No local index to normalize |
-| Optional semantic search (`find_similar`, pgvector) | dropped | Out of scope |
-| Kill-switch, tiers, circuit breaker, startup gate, recipient guard, two-phase confirm | kept | Same order, one dispatcher |
-| Send rate cap (`EWS_MAX_SENDS_PER_HOUR`) | dropped | Minimal |
-| Hash-chained audit log | dropped | Use the server log |
-| Persistent alias store (SQLite) | in-memory | Aliases reset on restart |
-| stdio transport, REST shim, OpenAPI, `/metrics` | Streamable HTTP + `/health` | FastAPI-hosted MCP only |
-| Heartbeat re-probe, protocol-cache eviction ladder | dropped | Warmup until first success, then the circuit breaker |
-
-Fixed compared with v5:
-
-- `check_availability` passes exchangelib `EWSDateTime`/`EWSTimeZone` values to
-  `get_free_busy_info` (v5 passes `zoneinfo` datetimes and fails with `'ms_id'`).
 - `get_event` retries without attendee properties when the server fails on them
   (grommunio, E-3127) and returns `attendees: null` with a note; `list_events` never asks
   for attendees.
 - Message dates fall back from `DateTimeReceived` to `DateTimeSent`.
 - exchangelib 5.0.3 cannot parse UTC timestamps with fractional seconds (grommunio sends
   `…05.198803600Z`); a small shim in `compat.py` fixes this so those dates are no longer `None`.
-- Free-text search uses restrictions (`subject`/`body` contains), not AQS query strings,
-  which some servers silently ignore.
+- Free-text search (`search_messages` `query`) can run two ways, chosen by configuration
+  (`EWS_SERVER_TYPE`, optionally overridden by `EWS_SEARCH_MODE`), never by probing the server:
+  - **AQS** (`QueryString`): uses the Exchange search index, so it stays fast on big
+    folders. The text is matched as a quoted phrase with word-prefix matching
+    (`q4 budg` finds "Q4 budget"); user input is quoted, so `AND`/`OR`/`from:` in it are
+    plain words. EWS forbids combining a query string with restrictions, so subject,
+    exact sender, unread and attachment filters are written into the AQS string
+    (`subject:"…"*`, `from:"…"`, `isread:false`, `hasattachment:true`). `since`/`until`
+    are applied to the index hits instead (AQS dates are day-granular and parsed in the
+    server's locale). Exchange returns at most 250 hits per AQS search; the result `note`
+    says when that cap may have cut results. If the server rejects the query, the search
+    falls back to restrictions and says so.
+  - **Restrictions** (`subject`/`body` contains): exact substring matching that works on
+    every server, but body restrictions skip the index and scan the folder.
+  - `EWS_SERVER_TYPE=exchange` (default) uses AQS; `grommunio` uses restrictions and
+    searches the body via PR_BODY straight away. If the server rejects a body property,
+    the search moves to the next one and logs a WARNING that `EWS_SERVER_TYPE` may be
+    wrong. grommunio reports Exchange 2013 SP1 (`15.0.847.4040`); when the server reports
+    that build while `EWS_SERVER_TYPE=exchange`, the connect log warns about it.
+- Logging: at startup the search config is logged; on connect the server build and
+  configured type. Every `search_messages` call logs one INFO line (folder, mode, body
+  field, which filters were used, hits, items scanned client-side, duration), never the
+  search terms or addresses themselves; the AQS string is logged at DEBUG only. Fallbacks
+  and capped results are logged as WARNING. `get_server_status` reports the search config.
 
 ## Development
 
@@ -232,7 +237,8 @@ Then run the integration suite against it:
 ```bash
 export EWS_IT_URL=https://127.0.0.1/EWS/Exchange.asmx EWS_IT_INSECURE=1 EWS_IT_TZ=Europe/Berlin \
        EWS_IT_USER=alice@grommunio.test EWS_IT_PASSWORD='Al1cePass!' \
-       EWS_IT_PEER=bob@grommunio.test   EWS_IT_PEER_PASSWORD='B0bPass!!'
+       EWS_IT_PEER=bob@grommunio.test   EWS_IT_PEER_PASSWORD='B0bPass!!' \
+       EWS_IT_SERVER_TYPE=grommunio
 uv run pytest -m integration
 ```
 
@@ -252,8 +258,16 @@ Integration tests tag everything they create with a unique marker and delete it 
 
 **grommunio EWS limitations** (lite works around them; real Exchange does not have them):
 
-- Body text cannot be searched (`ErrorInvalidRestriction`, E-3224): `search_messages`
-  falls back to subject-only matching and says so in a `note`.
+- A Contains restriction on `item:Body` is rejected (`ErrorInvalidRestriction`, E-3224;
+  gromox has no mapping for that field). With `EWS_SERVER_TYPE=grommunio`,
+  `search_messages` searches the MAPI property PR_BODY (0x1000) instead, which works
+  (case-insensitive); only if that is rejected too does it fall back to subjects and say
+  so in a `note`. PR_BODY is the plain-text body: delivered mail
+  (including HTML-only) has it, but an HTML-only item created via EWS (e.g. an HTML draft)
+  does not, so its body text is not found.
+- AQS query strings are ignored: gromox's `FindItem` does not parse `QueryString` and
+  returns the whole folder unfiltered. `EWS_SERVER_TYPE=grommunio` uses restrictions
+  instead, and `EWS_SEARCH_MODE=aqs` is refused with that server type.
 - Attendee properties of plain appointments fail (E-3127): see `get_event` above.
 - Filtering by conversation id returns nothing: `get_thread` shows only the message
   itself, and `waiting_on` matches replies by conversation id and normalized subject.
@@ -335,5 +349,4 @@ input and result, the final answer), `transcript.jsonl` (the raw stream-json out
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Portions derived from
-[ews-mcp](https://github.com/azizmazrou/ews-mcp) (MIT).
+MIT, see [LICENSE](LICENSE).

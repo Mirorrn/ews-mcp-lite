@@ -6,6 +6,7 @@ Enable with:
     EWS_IT_PEER=bob@grommunio.test     EWS_IT_PEER_PASSWORD=...   (second mailbox)
     EWS_IT_INSECURE=1                  (self-signed certificate)
     EWS_IT_TZ=Europe/Berlin
+    EWS_IT_SERVER_TYPE=grommunio       (default: exchange)
 Run: uv run pytest -m integration
 
 Every item a test creates carries a unique marker in its subject; a session
@@ -39,11 +40,13 @@ if os.environ.get("EWS_IT_INSECURE") == "1":
 USER = os.environ["EWS_IT_USER"]
 PEER = os.environ.get("EWS_IT_PEER")
 TZ = os.environ.get("EWS_IT_TZ", "UTC")
+SERVER_TYPE = os.environ.get("EWS_IT_SERVER_TYPE", "exchange")
 
 
 def settings(**kw: Any) -> Settings:
     base = dict(ews_server_url=URL, ews_email=USER, ews_password=os.environ["EWS_IT_PASSWORD"],
                 ews_insecure_skip_verify=os.environ.get("EWS_IT_INSECURE") == "1", ews_tz=TZ,
+                ews_server_type=SERVER_TYPE,
                 ews_capability_tier="full", send_enabled=True)
     base.update(kw)
     return Settings(_env_file=None, **base)
