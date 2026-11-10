@@ -112,14 +112,35 @@ def msg_full(item: Any, aliases: AliasStore, tz: str, max_chars: int = 4000,
         full["quoted_history"] = "stripped; use get_thread for the whole conversation"
     if cleaned["truncated"]:
         full["body_truncated"] = True
-    atts = [
-        {"index": i, "name": getattr(a, "name", None) or f"attachment-{i}",
-         "size_bytes": getattr(a, "size", None), "content_type": getattr(a, "content_type", None)}
-        for i, a in enumerate(getattr(item, "attachments", None) or [])
-    ]
-    if atts:
-        full["attachments"] = atts
+    files, inline = attachment_lists(item)
+    if files:
+        full["attachments"] = files
+    if inline:
+        full["inline_images"] = inline
     return full
+
+
+def is_inline(att: Any, html: str) -> bool:
+    """Embedded in the body (signature logo, pasted screenshot) rather than attached.
+    Some clients send such images without IsInline, so a cid: reference counts too.
+    `html` is the body, lowercased."""
+    if getattr(att, "is_inline", False):
+        return True
+    cid = (getattr(att, "content_id", None) or "").strip().strip("<>").lower()
+    return bool(cid) and f"cid:{cid}" in html
+
+
+def attachment_lists(item: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(real attachments, inline images). `index` is the position among ALL attachments,
+    which is what get_attachment takes."""
+    html = str(getattr(item, "body", None) or "").lower()
+    files: list[dict[str, Any]] = []
+    inline: list[dict[str, Any]] = []
+    for i, a in enumerate(getattr(item, "attachments", None) or []):
+        entry = {"index": i, "name": getattr(a, "name", None) or f"attachment-{i}",
+                 "size_bytes": getattr(a, "size", None), "content_type": getattr(a, "content_type", None)}
+        (inline if is_inline(a, html) else files).append(entry)
+    return files, inline
 
 
 def event_card(item: Any, aliases: AliasStore, tz: str) -> dict[str, Any]:

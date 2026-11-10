@@ -1,11 +1,12 @@
 """End-to-end tool tests against a live EWS server (see conftest for setup)."""
 
+import base64
 import datetime as dt
 import uuid
 
 import anyio
 import pytest
-from exchangelib import Attendee, CalendarItem, HTMLBody, Mailbox, Message, Q, Task
+from exchangelib import Attendee, CalendarItem, FileAttachment, HTMLBody, Mailbox, Message, Q, Task
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, MeetingRequest
 
 from ews_mcp_lite.app import build_server
@@ -49,6 +50,85 @@ async def test_folders_search_message_attachment(server):
     assert since["count"] >= 1
     thread = await ok(server, "get_thread", {"id": first["id"]})
     assert thread["count"] >= 1
+
+
+PDF_BYTES = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+CSV_BYTES = b"Item,Amount\nTravel,1200\nHardware,4800\n"
+
+
+def _stored(me, folder, subject: str, body: str, sender: str, to: str, attachments=()) -> Message:
+    m = Message(account=me, folder=folder, subject=subject, body=body, author=Mailbox(email_address=sender),
+                to_recipients=[Mailbox(email_address=to)])
+    m.save()
+    for name, content in attachments:
+        m.attach(FileAttachment(name=name, content=content))
+    return m
+
+
+async def test_attachment_metadata_and_content(server, mark, me):
+    """Attachment metadata is visible at every level (card flag, get_message, get_thread)
+    and get_attachment returns the content by name and by index."""
+    subject = f"{mark} attachments"
+    _stored(me, me.inbox, subject, "two files attached", PEER or USER, USER,
+            [("numbers.csv", CSV_BYTES), ("scan.pdf", PDF_BYTES)])
+    _stored(me, me.inbox, f"{mark} plain", "no files here", PEER or USER, USER)
+    found = await ok(server, "search_messages", {"subject": mark, "has_attachments": True})
+    assert [c["subject"] for c in found["items"]] == [subject], "has_attachments filter"
+    card = found["items"][0]
+    assert card["attach"] is True
+    plain = await ok(server, "search_messages", {"subject": f"{mark} plain"})
+    assert "attach" not in plain["items"][0]
+
+    msg = (await ok(server, "get_message", {"id": card["id"]}))["message"]
+    atts = {a["name"]: a for a in msg["attachments"]}
+    assert set(atts) == {"numbers.csv", "scan.pdf"}
+    assert sorted(a["index"] for a in atts.values()) == [0, 1]
+    assert atts["numbers.csv"]["size_bytes"] == len(CSV_BYTES), atts
+    assert atts["scan.pdf"]["size_bytes"] == len(PDF_BYTES), atts
+    assert all(a["content_type"] for a in atts.values()), atts
+    assert "base64" not in str(msg) and "Travel,1200" not in str(msg), "get_message lists metadata, not content"
+
+    thread = await ok(server, "get_thread", {"id": card["id"]})
+    in_thread = next(i for i in thread["items"] if i["id"] == card["id"])
+    assert {a["name"] for a in in_thread["attachments"]} == {"numbers.csv", "scan.pdf"}
+
+    csv = await ok(server, "get_attachment", {"message_id": card["id"], "attachment": "numbers.csv"})
+    assert csv["mode"] == "text" and csv["text"] == CSV_BYTES.decode() and csv["size_bytes"] == len(CSV_BYTES)
+    pdf = await ok(server, "get_attachment", {"message_id": card["id"], "attachment": str(atts["scan.pdf"]["index"])})
+    assert pdf["mode"] == "base64" and base64.b64decode(pdf["base64"]) == PDF_BYTES and pdf["name"] == "scan.pdf"
+    good, err = await call(server, "get_attachment", {"message_id": card["id"], "attachment": "missing.doc"})
+    assert not good and err["code"] == "not_found"
+    good, err = await call(server, "get_attachment", {"message_id": plain["items"][0]["id"]})
+    assert not good and err["code"] == "not_found"
+
+
+async def test_get_thread_follows_conversation_across_inbox_and_sent(server, mark, me):
+    """A conversation is rebuilt from Inbox and Sent Items, oldest first, from any of its
+    messages or from the thread id; unrelated mail stays out."""
+    topic = f"{mark} thread {uuid.uuid4().hex[:6]}"
+    peer = PEER or "peer@example.com"
+    _stored(me, me.inbox, topic, "first: can you review the plan?", peer, USER)
+    await anyio.sleep(1.1)  # distinct timestamps: the order is asserted
+    _stored(me, me.sent, f"RE: {topic}", "second: yes, by Friday", USER, peer)
+    await anyio.sleep(1.1)
+    _stored(me, me.inbox, f"RE: {topic}", "third: thanks, Friday is fine", peer, USER, [("plan.csv", CSV_BYTES)])
+    _stored(me, me.inbox, f"{mark} unrelated", "not part of it", peer, USER)
+
+    found = await ok(server, "search_messages", {"subject": topic})  # default scope: all mail folders
+    assert sorted(c["folder"] for c in found["items"]) == ["Inbox", "Inbox", "Sent Items"], found["items"]
+    assert len({c["thread"] for c in found["items"]}) == 1, found["items"]
+    inbox_only = await ok(server, "search_messages", {"subject": topic, "folder": "inbox"})
+    assert inbox_only["count"] == 2 and all("folder" not in c for c in inbox_only["items"])
+    newest = found["items"][0]
+    for ref in (newest["id"], newest["thread"]):
+        thread = await ok(server, "get_thread", {"id": ref})
+        bodies = [i["body"].split(":")[0] for i in thread["items"]]
+        assert bodies == ["first", "second", "third"], (ref, thread)
+        assert thread["thread"] == newest["thread"] and "note" not in thread
+        assert [bool(i.get("attachments")) for i in thread["items"]] == [False, False, True]
+    sent = await ok(server, "search_messages", {"subject": topic, "folder": "sent"})
+    from_sent = await ok(server, "get_thread", {"id": sent["items"][0]["id"]})
+    assert from_sent["count"] == 3, "starting from the sent message finds the same thread"
 
 
 async def test_search_follows_server_type(gateway):
@@ -313,8 +393,73 @@ async def test_delete_messages_confirm_flow(server, mark, me):
     assert not good and err["code"] == "confirm_invalid"
 
 
-async def test_recipient_guard_live(gateway, mark):
+async def test_recipient_guard_live(gateway, mark, me):
+    """Drafts may name anyone; the allowlist is enforced on the draft's recipients at send time."""
     mcp, _ = build_server(settings(ews_recipient_allowlist="*@grommunio.test"), gateway)
-    good, err = await call(mcp, "create_draft", {"to": ["someone@example.com"], "subject": f"{mark} rg",
-                                                "body": "x"})
+    subject = f"{mark} rg"
+    d = await ok(mcp, "create_draft", {"to": ["someone@example.com"], "subject": subject, "body": "x"})
+    good, err = await call(mcp, "send_draft", {"draft_id": d["draft_id"]})
     assert not good and err["code"] == "recipient_blocked"
+    assert list(me.drafts.filter(subject=subject).only("id")), "a blocked send must leave the draft in place"
+
+
+async def test_search_all_finds_mail_in_new_subfolder_by_sender_name(server, mark, me):
+    """folder='all' (the default for searches) reaches a subfolder created after the server
+    started, and a sender name fragment is matched server-side."""
+    from exchangelib.folders import Folder
+    sub = Folder(parent=me.inbox, name=f"{mark} sub")
+    sub.save()
+    try:
+        m = Message(account=me, folder=sub, subject=f"{mark} filed away", body="kept in a subfolder",
+                    author=Mailbox(name="Katarina Lindqvist", email_address="k.lindqvist@uni-example.edu"),
+                    to_recipients=[Mailbox(email_address=USER)])
+        m.save()
+        found = await ok(server, "search_messages", {"subject": f"{mark} filed"})
+        assert [(c["subject"], c["folder"]) for c in found["items"]] == [(f"{mark} filed away", f"Inbox/{mark} sub")]
+        by_name = await ok(server, "search_messages", {"sender": "lindqv", "subject": mark})
+        assert [c["subject"] for c in by_name["items"]] == [f"{mark} filed away"], by_name
+        assert "incomplete" not in by_name.get("note", ""), "sender name must be matched server-side"
+        assert not (await ok(server, "search_messages", {"subject": f"{mark} filed", "folder": "inbox"}))["items"]
+    finally:
+        sub.delete()
+
+
+async def test_inline_images_and_big_attachments(server, mark, me):
+    """Inline images are listed apart from real attachments; files over 512 KiB are refused
+    from their size alone, which the server must report."""
+    big = b"%PDF-1.4\n" + b"0" * (700 * 1024)
+    html = ('<html><body><p>Numbers attached.</p><img src="cid:logo@corp"><p>--</p>'
+            '<img src="cid:sig@corp"></body></html>')
+    m = Message(account=me, folder=me.inbox, subject=f"{mark} inline", body=HTMLBody(html),
+                author=Mailbox(email_address=PEER or USER), to_recipients=[Mailbox(email_address=USER)])
+    m.save()
+    m.attach(FileAttachment(name="logo.png", content=b"\x89PNG-logo", content_type="image/png", is_inline=True,
+                            content_id="logo@corp"))
+    m.attach(FileAttachment(name="sig.png", content=b"\x89PNG-sig", content_type="image/png", content_id="sig@corp"))
+    m.attach(FileAttachment(name="numbers.csv", content=CSV_BYTES, content_type="text/csv"))
+    m.attach(FileAttachment(name="big.pdf", content=big, content_type="application/pdf"))
+    only_inline = Message(account=me, folder=me.inbox, subject=f"{mark} logo only", body=HTMLBody(html),
+                          author=Mailbox(email_address=PEER or USER), to_recipients=[Mailbox(email_address=USER)])
+    only_inline.save()
+    only_inline.attach(FileAttachment(name="logo.png", content=b"\x89PNG", content_type="image/png", is_inline=True,
+                                      content_id="logo@corp"))
+
+    card = (await ok(server, "search_messages", {"subject": f"{mark} inline"}))["items"][0]
+    msg = (await ok(server, "get_message", {"id": card["id"]}))["message"]
+    assert sorted(a["name"] for a in msg["attachments"]) == ["big.pdf", "numbers.csv"], msg
+    assert sorted(a["name"] for a in msg["inline_images"]) == ["logo.png", "sig.png"], msg
+    sizes = {a["name"]: a["size_bytes"] for a in msg["attachments"]}
+    assert sizes["big.pdf"] and sizes["big.pdf"] >= len(big), f"server must report sizes: {sizes}"
+
+    default = await ok(server, "get_attachment", {"message_id": card["id"]})
+    assert default["name"] in ("numbers.csv", "big.pdf") and "inline" not in default
+    pdf = await ok(server, "get_attachment", {"message_id": card["id"], "attachment": "big.pdf"})
+    assert pdf["mode"] == "metadata" and "not downloaded" in pdf["note"], pdf
+    logo_index = next(a["index"] for a in msg["inline_images"] if a["name"] == "logo.png")
+    logo = await ok(server, "get_attachment", {"message_id": card["id"], "attachment": str(logo_index)})
+    assert logo["inline"] is True and base64.b64decode(logo["base64"]) == b"\x89PNG-logo"
+
+    lone = (await ok(server, "search_messages", {"subject": f"{mark} logo only"}))["items"][0]
+    print(f"\n[inline-only] card attach flag on this server: {lone.get('attach', False)}")
+    good, err = await call(server, "get_attachment", {"message_id": lone["id"]})
+    assert not good and err["code"] == "not_found" and "inline image" in err["message"], err

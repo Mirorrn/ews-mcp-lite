@@ -7,27 +7,70 @@ import time
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 
-from exchangelib import Body, Message, Q
+from exchangelib import Body, FileAttachment, Message, Q
+from exchangelib.folders import SentItems
 from exchangelib.properties import ConversationId
 from pydantic import Field
 
 from .. import aqs
-from ..compat import fields_without_pr_body
+from ..compat import PR_CONVERSATION_ID, SENDER_PROPS, fields_without_mapi_extras, mapi_conversation_id
 from ..dates import parse_when
-from ..dto import body_text, msg_card, msg_full, page
+from ..dto import body_text, is_inline, message_date, msg_card, msg_full, page
 from ..errors import Failure, classify
 from ..registry import Registry
-from .common import check_page, fetch_one, mailboxes, resolve_folder, resolve_many, take
+from .common import (
+    check_page,
+    fetch_one,
+    mail_folders,
+    mailboxes,
+    parallel,
+    refresh_folders,
+    resolve_folder,
+    resolve_many,
+    take,
+)
 
 CARD_FIELDS = ["id", "changekey", "subject", "sender", "datetime_received", "datetime_sent",
                "is_read", "has_attachments", "conversation_id", "importance", "categories",
                "text_body"]
-SENDER_SCAN_CAP = 500
-WAITING_SENT_CAP = 200
-WAITING_INBOUND_CAP = 1000
+# Client-side sender-name scan, used only when a server rejects the MAPI sender restriction.
+SENDER_SCAN_CAP = 2000
+# folder='all' merges per-folder results client-side, so deep pages get expensive.
+ALL_FOLDERS_WINDOW = 1000
+WAITING_SENT_CAP = 1000
+WAITING_INBOUND_CAP = 5000  # per folder
+# Server answers that mean "this restriction/property is not supported here".
+REJECTED = ("ErrorInvalidRestriction", "ErrorUnsupportedPathForQuery", "ErrorInvalidPropertyRequest",
+            "ErrorUnsupportedQueryFilter")
 TEXT_TYPES = ("text/", "application/json", "application/xml", "application/csv")
 MAX_INLINE_BYTES = 512 * 1024
 logger = logging.getLogger(__name__)
+
+
+def _rejected(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}"
+    return any(code in text for code in REJECTED)
+
+
+def _sender_q(term: str) -> Q:
+    """Substring match on the sender's or the sent-representing ('From') name and address."""
+    first, *rest = (Q(**{f"{prop}__icontains": term}) for prop in SENDER_PROPS)
+    for q in rest:
+        first |= q
+    return first
+
+
+def _read_capped(att: Any, cap: int) -> bytes | None:
+    """Attachment content, or None if it is longer than `cap` (reading stops at cap+1 bytes,
+    so an oversized file is never pulled in full)."""
+    local = getattr(att, "_content", None)  # already in memory, e.g. on an item built locally
+    if local is not None or getattr(att, "attachment_id", None) is None:
+        data = local or b""
+    else:
+        with att.fp as fp:
+            data = fp.read(cap + 1)
+        att._fp = None  # the stream was cut short: never reuse it
+    return None if len(data) > cap else data
 
 
 def _ordered(qs: Any) -> Any:
@@ -47,6 +90,7 @@ def register(r: Registry) -> None:
     ) -> dict[str, Any]:
         """List mail folders as a tree walk: id (f-alias), name, path, total, unread, children."""
         def work(account):
+            refresh_folders(account)  # live counts, and folders created since the last call
             root = resolve_folder(account, parent, ctx.aliases) if parent else account.msg_folder_root
             out: list[dict[str, Any]] = []
 
@@ -69,9 +113,12 @@ def register(r: Registry) -> None:
             "Free text matched against subject and body. On Exchange this uses the search index "
             "(all words, in order, each as a word prefix: 'q4 budg' finds 'Q4 budget'); on other "
             "servers a substring match. Plain text only, no AQS syntax."))] = None,
-        folder: Annotated[str, Field(description="Folder: inbox, sent, drafts, trash, an f-alias or a path.")] = "inbox",
+        folder: Annotated[str | None, Field(description=(
+            "Where to look: 'all' = every mail folder with its subfolders, Sent Items included (not "
+            "Deleted Items, Junk, Drafts); or inbox, sent, drafts, trash, an f-alias or a path such as "
+            "'Inbox/Projects'. Default: 'all' when query, subject or sender is given, else 'inbox'."))] = None,
         sender: Annotated[str | None, Field(
-            description="Exact sender address (server-side) or a name/email substring (client-side, first 500 items).")] = None,
+            description="Sender: an exact email address, or part of a name or address ('lindqvist').")] = None,
         subject: Annotated[str | None, Field(
             description="Subject substring (word-prefix match when `query` uses the search index).")] = None,
         since: Annotated[str | None, Field(description="'today', '-7d', YYYY-MM-DD or ISO datetime.")] = None,
@@ -81,14 +128,20 @@ def register(r: Registry) -> None:
         offset: Annotated[int, Field(ge=0)] = 0,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict[str, Any]:
-        """Search mail live in one folder, newest first. Returns compact cards with
-        short ids (m1, m2 …) for get_message / get_thread / drafts."""
+        """Search mail live, newest first: in one folder, or across the whole mailbox with
+        folder='all' (then each card names its folder). Returns compact cards with short ids
+        (m1, m2 …) for get_message / get_thread / drafts."""
         check_page(offset, limit)
         text = (query or "").strip() if aqs.phrase(query) else ""
         lo = parse_when(since, "since", ctx.tz) if since else None
         hi = parse_when(until, "until", ctx.tz) if until else None
         exact_sender = sender.strip() if sender and "@" in sender and " " not in sender.strip() else None
-        fuzzy = sender.lower() if sender and not exact_sender else None
+        fuzzy = sender.strip().lower() if sender and sender.strip() and not exact_sender else None
+        scope_all = (folder or ("all" if (text or subject or sender) else "inbox")).strip().lower() in ("all", "*")
+        label = "all" if scope_all else (folder or "inbox")
+        if scope_all and offset + limit > ALL_FOLDERS_WINDOW:
+            raise Failure("validation", f"folder='all' pages up to offset+limit={ALL_FOLDERS_WINDOW}",
+                          "Narrow the search (query, sender, since) or pick one folder.")
         base = Q()
         if subject:
             base &= Q(subject__icontains=subject)
@@ -103,16 +156,10 @@ def register(r: Registry) -> None:
         if exact_sender:
             base &= Q(sender=exact_sender)
 
-        def run(account, target, qs, with_dates: bool, cap: int) -> tuple[list[Any], bool, int | None, bool]:
-            """Page through qs. Fuzzy sender (and, for AQS, since/until) are checked
-            client-side on a light scan of at most `cap` items; only the requested
-            page is then fetched in full. -> (rows, more, scanned, complete)."""
-            qs = _ordered(qs)
-            if not fuzzy and not with_dates:
-                rows, more = take(qs.only(*CARD_FIELDS), offset, limit)
-                return rows, more, None, True  # no client-side scan
-            fields = ["id", "changekey", "sender"] + (["datetime_received", "datetime_sent"] if with_dates else [])
-            hits, scanned, complete = [], 0, False
+        def scan(qs, fields, with_dates: bool, client_sender: bool, cap: int, need: int):
+            """Light scan of at most `cap` rows; stops once `need` hits are found.
+            -> (hits, scanned, complete)."""
+            hits, scanned, done = [], 0, False
             for m in qs.only(*fields)[0:cap]:  # QuerySet slices page lazily, server-side
                 scanned += 1
                 if with_dates:
@@ -120,24 +167,74 @@ def register(r: Registry) -> None:
                     if when is None or (hi is not None and when > hi):
                         continue
                     if lo is not None and when < lo:  # newest first: the rest is older
-                        complete = True
+                        done = True
                         break
-                if fuzzy and fuzzy not in (f"{getattr(m.sender, 'name', '')} "
-                                           f"{getattr(m.sender, 'email_address', '')}").lower():
+                if client_sender and fuzzy not in (f"{getattr(m.sender, 'name', '')} "
+                                                   f"{getattr(m.sender, 'email_address', '')}").lower():
                     continue
                 hits.append(m)
-            complete = complete or scanned < cap
-            hits, more = take(hits, offset, limit)
-            rows = [m for m in account.fetch(ids=[(m.id, m.changekey) for m in hits], folder=target,
+                if len(hits) >= need:
+                    done = True
+                    break
+            return hits, scanned, done or scanned < cap
+
+        def run(account, scope, qs_for, with_dates: bool, client_sender: bool, cap: int):
+            """Page through qs_for(folder) over every folder in scope.
+            -> (rows, more, scanned, complete, {id: folder path})."""
+            if len(scope) == 1 and not with_dates and not client_sender:  # one folder: server-side offset
+                rows, more = take(_ordered(qs_for(scope[0][1])).only(*CARD_FIELDS), offset, limit)
+                return rows, more, None, True, {}
+            # Several folders (EWS cannot sort across them) or client-side filters: read light rows
+            # newest first per folder, merge, then fetch full cards for the requested page only.
+            need = offset + limit + 1
+            multi = len(scope) > 1
+            filtered = with_dates or client_sender
+            fields = (["id", "changekey"] + (["sender"] if client_sender else [])
+                      + (["datetime_received", "datetime_sent"] if with_dates or multi else []))
+
+            def one(entry):
+                path, f = entry
+                hits, scanned, complete = scan(_ordered(qs_for(f)), fields, with_dates, client_sender,
+                                               cap if filtered else need, need)
+                return [(m, path) for m in hits], scanned, complete
+            results = parallel(one, scope)
+            merged = [h for hits, _, _ in results for h in hits]
+            if multi:
+                merged.sort(key=lambda h: (message_date(h[0]) is not None, message_date(h[0]) or 0), reverse=True)
+            hits, more = take(merged, offset, limit)
+            rows = [m for m in account.fetch(ids=[(m.id, m.changekey) for m, _ in hits], folder=scope[0][1],
                                              only_fields=CARD_FIELDS)
                     if m is not None and not isinstance(m, Exception)] if hits else []
-            return rows, more, scanned, complete
+            scanned = sum(n for _, n, _ in results) if filtered else None
+            return rows, more, scanned, all(c for _, _, c in results), {m.id: path for m, path in hits}
 
-        def by_restriction(account, target, notes: list[str], info: dict[str, Any]) -> tuple[list[Any], bool]:
+        def by_restriction(account, scope, notes: list[str], info: dict[str, Any]):
             info["mode"] = "restriction"
+            # A sender name goes server-side through the MAPI sender properties; if the server
+            # rejects that, it is matched client-side on a light scan instead.
+            modes = ("server", "client") if fuzzy else ("none",)
+            for i, sender_mode in enumerate(modes):
+                attempt: list[str] = []
+                try:
+                    res = restriction_attempt(account, scope, sender_mode, attempt, info)
+                except Exception as e:
+                    if i + 1 < len(modes) and _rejected(e):
+                        logger.warning("search_messages: server rejected a sender-name restriction (%s); "
+                                       "matching sender names client-side", type(e).__name__)
+                        continue
+                    raise
+                notes += attempt
+                if fuzzy:
+                    info["sender"] = sender_mode
+                return res
+            raise AssertionError("unreachable")
+
+        def restriction_attempt(account, scope, sender_mode: str, notes: list[str], info: dict[str, Any]):
+            q0 = base & _sender_q(sender.strip()) if sender_mode == "server" else base
+            client = sender_mode == "client"
             if not text:
-                rows, more, scanned, complete = run(account, target, target.all() if base.is_empty()
-                                                    else target.filter(base), False, SENDER_SCAN_CAP)
+                qs_for = (lambda f: f.all()) if q0.is_empty() else (lambda f: f.filter(q0))
+                res = run(account, scope, qs_for, False, client, SENDER_SCAN_CAP)
             else:
                 # Body properties as configured for the server type (Exchange: item:Body,
                 # then PR_BODY; grommunio: PR_BODY only), then subjects only. A rejected
@@ -148,11 +245,10 @@ def register(r: Registry) -> None:
                     if body:
                         q |= Q(**{f"{body}__icontains": text})
                     try:
-                        rows, more, scanned, complete = run(account, target, target.filter(base & q),
-                                                            False, SENDER_SCAN_CAP)
+                        res = run(account, scope, lambda f, q=q: f.filter(q0 & q), False, client, SENDER_SCAN_CAP)
                         break
                     except Exception as e:
-                        if not body or "ErrorInvalidRestriction" not in f"{type(e).__name__} {e}":
+                        if not body or not _rejected(e):
                             raise
                         logger.warning("search_messages: server rejected a body search on %s (%s); "
                                        "trying %s. Check EWS_SERVER_TYPE=%s", body, type(e).__name__,
@@ -161,32 +257,34 @@ def register(r: Registry) -> None:
                 info["body_field"] = body or "none"
                 if not body:
                     notes.append("this server cannot search message bodies; matched subjects only")
-            info["scanned"] = scanned
-            if not complete:
-                notes.append(f"sender name matched client-side within the newest {SENDER_SCAN_CAP} "
-                             "messages only; results may be incomplete - pass an exact email address "
-                             "for a full server-side search")
-            return rows, more
+            info["scanned"] = res[2]
+            if not res[3]:
+                per = " per folder" if len(scope) > 1 else ""
+                notes.append(f"sender name matched client-side within the newest {SENDER_SCAN_CAP} messages"
+                             f"{per} only; results may be incomplete - pass an exact email address for a "
+                             "full server-side search")
+            return res
 
-        def by_index(account, target, notes: list[str], info: dict[str, Any]) -> tuple[list[Any], bool]:
+        def by_index(account, scope, notes: list[str], info: dict[str, Any]):
             info["mode"] = "aqs"
             qstr = aqs.build_query(text, subject=subject, exact_sender=exact_sender,
                                    unread_only=unread_only, has_attachments=has_attachments)
             with_dates = lo is not None or hi is not None
             logger.debug("search_messages: AQS query string %r", qstr)
-            rows, more, scanned, complete = run(account, target, target.filter(Q(qstr)), with_dates,
-                                                aqs.AQS_HIT_CAP)
+            res = run(account, scope, lambda f: f.filter(Q(qstr)), with_dates, bool(fuzzy), aqs.AQS_HIT_CAP)
+            rows, more, scanned, complete, _ = res
             info["scanned"] = scanned
+            per = " per folder" if len(scope) > 1 else ""
             notes.append(f"matched via the Exchange search index (word-prefix match, at most "
-                         f"{aqs.AQS_HIT_CAP} hits per search)")
+                         f"{aqs.AQS_HIT_CAP} hits per search{per})")
             client = " and ".join(w for w, on in (("sender name", fuzzy), ("date range", with_dates)) if on)
             if client and not complete:
-                notes.append(f"{client} applied to the newest {aqs.AQS_HIT_CAP} index hits only; "
+                notes.append(f"{client} applied to the newest {aqs.AQS_HIT_CAP} index hits{per} only; "
                              "results may be incomplete - make the query more specific")
             elif not client and not more and offset + len(rows) >= aqs.AQS_HIT_CAP:
                 notes.append(f"the index returns at most {aqs.AQS_HIT_CAP} hits; later matches are "
                              "cut off - make the query more specific")
-            return rows, more
+            return res
 
         filters = [name for name, on in (("text", text), ("subject", subject), ("since", lo is not None),
                                          ("until", hi is not None), ("unread", unread_only),
@@ -195,33 +293,47 @@ def register(r: Registry) -> None:
 
         def work(account):
             started = time.monotonic()
-            target = resolve_folder(account, folder, ctx.aliases)
+            if scope_all:
+                scope = mail_folders(account) or [("Inbox", account.inbox)]
+            else:
+                scope = [(folder or "inbox", resolve_folder(account, folder or "inbox", ctx.aliases))]
             notes: list[str] = []
             info: dict[str, Any] = {}
             if text and ctx.settings.search_mode == "aqs":
                 try:
-                    rows, more = by_index(account, target, notes, info)
+                    res = by_index(account, scope, notes, info)
                 except Exception as e:
                     if classify(e).code in ("auth_failed", "upstream_unavailable"):
                         raise
                     logger.warning("search_messages: AQS search failed (%s: %s); falling back to "
                                    "restrictions", type(e).__name__, str(e)[:200])
                     notes = [f"index search failed ({type(e).__name__}); used a substring search instead"]
-                    rows, more = by_restriction(account, target, notes, info)
+                    res = by_restriction(account, scope, notes, info)
                     info["fallback"] = "aqs_failed"
             else:
-                rows, more = by_restriction(account, target, notes, info)
-            out = page([msg_card(m, ctx.aliases, ctx.tz) for m in rows], offset, more)
+                res = by_restriction(account, scope, notes, info)
+            rows, more, _, _, where = res
+            cards = []
+            for m in rows:
+                card = msg_card(m, ctx.aliases, ctx.tz)
+                if scope_all:
+                    card["folder"] = where.get(m.id, scope[0][0])
+                cards.append(card)
+            out = page(cards, offset, more)
+            if len(scope) > 1:
+                notes.insert(0, f"searched {len(scope)} mail folders")
             if notes:
                 out["note"] = "; ".join(notes)
             # Search terms and addresses stay out of INFO logs (they are mailbox content).
-            logger.info("search_messages folder=%s mode=%s body_field=%s filters=%s hits=%d more=%s "
-                        "scanned=%s offset=%d limit=%d took_ms=%d%s", folder, info.get("mode"),
-                        info.get("body_field", "-"), ",".join(filters) or "-", len(rows), more,
-                        info.get("scanned") if info.get("scanned") is not None else "-", offset, limit, (time.monotonic() - started) * 1000,
+            logger.info("search_messages folder=%s folders=%d mode=%s body_field=%s sender=%s filters=%s "
+                        "hits=%d more=%s scanned=%s offset=%d limit=%d took_ms=%d%s", label, len(scope),
+                        info.get("mode"), info.get("body_field", "-"), info.get("sender", "-"),
+                        ",".join(filters) or "-", len(rows), more,
+                        info.get("scanned") if info.get("scanned") is not None else "-", offset, limit,
+                        (time.monotonic() - started) * 1000,
                         f" fallback={info['fallback']}" if "fallback" in info else "")
             if any("incomplete" in n or "cut off" in n for n in notes):
-                logger.warning("search_messages: result capped (folder=%s mode=%s): %s", folder,
+                logger.warning("search_messages: result capped (folder=%s mode=%s): %s", label,
                                info.get("mode"), "; ".join(n for n in notes if "incomplete" in n or "cut off" in n))
             return out
         return await ctx.gateway.call(work)
@@ -263,15 +375,19 @@ def register(r: Registry) -> None:
             items: list[Any] = []
             note = None
             if conv_raw:
-                thread_fields = [f.name for f in fields_without_pr_body(Message.supported_fields(account.version))]
+                thread_fields = [f.name for f in fields_without_mapi_extras(Message.supported_fields(account.version))]
+                # grommunio returns nothing for item:ConversationId; it filters on the MAPI property.
+                mapi = (mapi_conversation_id(conv_raw)
+                        if ctx.settings.ews_server_type == "grommunio" else None)
+                match = ({PR_CONVERSATION_ID: mapi} if mapi
+                         else {"conversation_id": ConversationId(id=conv_raw)})
                 try:
                     for f in (account.inbox, account.sent):
-                        items += list(f.filter(conversation_id=ConversationId(id=conv_raw))
-                                      .only(*thread_fields)[:limit])
+                        items += list(f.filter(**match).only(*thread_fields)[:limit])
                 except Exception:
                     items, note = [], "this server cannot filter by conversation; showing the message only"
-            if not items and seed is not None:
-                items = [seed]
+            if seed is not None:  # it may live in a subfolder that the conversation lookup skips
+                items.append(seed)
             seen, unique = set(), []
             for it in items:
                 if it.id not in seen:
@@ -290,34 +406,49 @@ def register(r: Registry) -> None:
     @r.tool("read", "read")
     async def get_attachment(
         message_id: Annotated[str, Field(description="Message id (m3) that carries the attachment.")],
-        attachment: Annotated[str | None, Field(description="Attachment name or index; default: the first one.")] = None,
+        attachment: Annotated[str | None, Field(description=(
+            "Attachment name or index (from get_message, also for inline_images); "
+            "default: the first real attachment, never an inline image."))] = None,
     ) -> dict[str, Any]:
         """Read one attachment. Text-like files come back as text, others as base64
-        (up to 512 KiB); bigger files return metadata only."""
+        (up to 512 KiB); bigger files return metadata only and are not downloaded."""
         raw, _ = ctx.aliases.resolve(message_id, expect=("m", "d"))
 
         def work(account):
             item = fetch_one(account, raw)
             atts = list(getattr(item, "attachments", None) or [])
+            html = str(getattr(item, "body", None) or "").lower()
             if not atts:
                 raise Failure("not_found", "This message has no attachments.")
-            chosen = atts[0]
-            if attachment is not None:
-                if attachment.isdigit() and int(attachment) < len(atts):
-                    chosen = atts[int(attachment)]
-                else:
-                    chosen = next((a for a in atts if (a.name or "") == attachment), None)
-                    if chosen is None:
-                        raise Failure("not_found", f"No attachment named {attachment!r}.",
-                                      "Call get_message to see the attachment list.")
-            content = getattr(chosen, "content", None)
-            meta = {"name": chosen.name, "size_bytes": getattr(chosen, "size", None),
-                    "content_type": getattr(chosen, "content_type", None)}
-            if content is None:
-                return {**meta, "mode": "metadata", "note": "item attachment; open it with get_message"}
+            if attachment is None:
+                files = [a for a in atts if not is_inline(a, html)]
+                if not files:
+                    raise Failure("not_found", f"This message has no attachments, only {len(atts)} inline "
+                                  "image(s) embedded in the body.",
+                                  "Pass attachment=<index> from get_message's inline_images to read one.")
+                chosen = files[0]
+            elif attachment.isdigit() and int(attachment) < len(atts):
+                chosen = atts[int(attachment)]
+            else:
+                chosen = next((a for a in atts if (a.name or "") == attachment), None)
+                if chosen is None:
+                    raise Failure("not_found", f"No attachment named {attachment!r}.",
+                                  "Call get_message to see the attachment list.")
+            size = getattr(chosen, "size", None)
+            meta = {"name": chosen.name, "size_bytes": size, "content_type": getattr(chosen, "content_type", None)}
+            if is_inline(chosen, html):
+                meta["inline"] = True
+            if not isinstance(chosen, FileAttachment):
+                return {**meta, "mode": "metadata", "note": "item attachment (a message or event); not readable here"}
+            # The size is part of the message metadata: refuse big files before any download.
+            if size is not None and size > MAX_INLINE_BYTES:
+                return {**meta, "mode": "metadata", "note": f"too large to return (limit {MAX_INLINE_BYTES} bytes); "
+                                                             "not downloaded"}
+            content = _read_capped(chosen, MAX_INLINE_BYTES)
+            if content is None:  # the server sent no size: the capped read stopped the download
+                return {**meta, "mode": "metadata", "note": f"too large to return (more than {MAX_INLINE_BYTES} "
+                                                             "bytes); download stopped"}
             ctype = (meta["content_type"] or "").lower()
-            if len(content) > MAX_INLINE_BYTES:
-                return {**meta, "mode": "metadata", "note": "too large to inline"}
             if ctype.startswith(TEXT_TYPES) or (chosen.name or "").lower().endswith((".txt", ".csv", ".md", ".json")):
                 return {**meta, "mode": "text", "text": content.decode("utf-8", "replace")}
             return {**meta, "mode": "base64", "base64": base64.b64encode(content).decode()}
@@ -328,52 +459,88 @@ def register(r: Registry) -> None:
         days: Annotated[int, Field(ge=1, le=60, description="Only sent mail older than this many days.")] = 3,
         limit: Annotated[int, Field(ge=1, le=50)] = 20,
         lookback_days: Annotated[int, Field(ge=1, le=90)] = 30,
+        to: Annotated[str | None, Field(
+            description="Only mail sent to this person: part of a name or address ('sandoval').")] = None,
     ) -> dict[str, Any]:
-        """Sent messages with no inbound reply after `days` days ('what am I waiting on?').
-        Live scan of Sent Items (capped at 200 messages) against the Inbox (not its subfolders)."""
+        """Sent messages with no reply after `days` days ('what am I waiting on?', 'did X get back
+        to me?'). Live scan of up to 1000 sent messages; replies are looked for in every mail folder."""
+        needle = (to or "").strip().lower()
+
+        def addressed_to(item) -> bool:
+            people = list(item.to_recipients or []) + list(item.cc_recipients or [])
+            return any(needle in f"{p.name or ''} {p.email_address or ''}".lower() for p in people)
 
         def work(account):
             tz = ctx.tz
             now = parse_when("now", "now", tz)
-            sent = (account.sent.filter(datetime_sent__gte=now - timedelta(days=lookback_days),
-                                        datetime_sent__lte=now - timedelta(days=days))
+            start = now - timedelta(days=lookback_days)
+            # Recipient fields are costly to read (resolved mailboxes): only when filtering by `to`.
+            fields = ["id", "changekey", "subject", "datetime_sent", "conversation_id"]
+            sent = (account.sent.filter(datetime_sent__gte=start, datetime_sent__lte=now - timedelta(days=days))
                     .order_by("-datetime_sent")
-                    .only("id", "changekey", "subject", "to_recipients", "datetime_sent",
-                          "conversation_id", "sender", "is_read", "has_attachments", "text_body"))
+                    .only(*fields, *(["to_recipients", "cc_recipients"] if needle else [])))
             sent_items = list(sent[:WAITING_SENT_CAP])
-            inbound = list(account.inbox.filter(datetime_sent__gte=now - timedelta(days=lookback_days))
-                           .only("subject", "conversation_id", "datetime_sent", "datetime_received")[:WAITING_INBOUND_CAP])
+            candidates = [s for s in sent_items if addressed_to(s)] if needle else sent_items
+            # Replies may have been filed anywhere: scan every mail folder except Sent Items.
+            folders = mail_folders(account, skip=(SentItems,)) or [("Inbox", account.inbox)]
+            # My own mail filed in a folder is not a reply. Excluded server-side by sender
+            # address (the sender field itself is costly to read); servers that reject the
+            # property get the scan without that exclusion.
+            me = (ctx.settings.ews_email or "").strip()
+            window = Q(datetime_sent__gte=start)
+
+            def recent(entry, exclude_me: bool = bool(me)):
+                _, f = entry
+                q = window & ~Q(pr_sender_smtp=me) if exclude_me else window
+                try:
+                    return list(f.filter(q).only("subject", "conversation_id", "datetime_sent", "datetime_received")
+                                [:WAITING_INBOUND_CAP])
+                except Exception as e:
+                    if not (exclude_me and _rejected(e)):
+                        raise
+                    logger.warning("waiting_on: server rejected the sender exclusion (%s)", type(e).__name__)
+                    return recent(entry, exclude_me=False)
+            per_folder = parallel(recent, folders)
             by_conv: dict[str, list[Any]] = {}
             by_subj: dict[str, list[Any]] = {}
-            for m in inbound:
-                cid = getattr(getattr(m, "conversation_id", None), "id", None)
-                if cid:
-                    by_conv.setdefault(cid, []).append(m)
-                by_subj.setdefault(_norm_subject(m.subject), []).append(m)
+            for rows in per_folder:
+                for m in rows:
+                    cid = getattr(getattr(m, "conversation_id", None), "id", None)
+                    if cid:
+                        by_conv.setdefault(cid, []).append(m)
+                    by_subj.setdefault(_norm_subject(m.subject), []).append(m)
             waiting = []
-            for s in sent_items:
+            for s in candidates:
                 when = s.datetime_sent
                 cid = getattr(getattr(s, "conversation_id", None), "id", None)
-                candidates = by_conv.get(cid, []) if cid else []
-                candidates += by_subj.get(_norm_subject(s.subject), [])
-                replied = any((c.datetime_received or c.datetime_sent) and
-                              (c.datetime_received or c.datetime_sent) > when for c in candidates)
-                if not replied:
-                    card = msg_card(s, ctx.aliases, ctx.tz)
-                    card["to"] = [r.email_address for r in (s.to_recipients or [])]
-                    waiting.append(card)
+                replies = (by_conv.get(cid, []) if cid else []) + by_subj.get(_norm_subject(s.subject), [])
+                if not any((c.datetime_received or c.datetime_sent) and
+                           (c.datetime_received or c.datetime_sent) > when for c in replies):
+                    waiting.append(s)
                 if len(waiting) >= limit:
                     break
-            note = (f"scanned {len(sent_items)} sent message(s) from the last {lookback_days} "
-                    f"days (cap {WAITING_SENT_CAP}); replies matched by conversation or subject "
-                    "in the Inbox only (not its subfolders)")
+            full = {m.id: m for m in account.fetch(ids=[(s.id, s.changekey) for s in waiting], folder=account.sent,
+                                                   only_fields=[*CARD_FIELDS, "to_recipients"])
+                    if m is not None and not isinstance(m, Exception)} if waiting else {}
+            items = []
+            for s in waiting:
+                item = full.get(s.id, s)
+                card = msg_card(item, ctx.aliases, ctx.tz)
+                card["to"] = [r.email_address for r in (getattr(item, "to_recipients", None) or [])]
+                items.append(card)
+            note = (f"scanned {len(sent_items)} sent message(s) from the last {lookback_days} days "
+                    f"(cap {WAITING_SENT_CAP})")
+            if needle:
+                note += f", {len(candidates)} of them to {to.strip()!r}"
+            note += f"; replies matched by conversation or subject in {len(folders)} mail folder(s)"
             if len(sent_items) >= WAITING_SENT_CAP:
                 note += (f"; WARNING: sent scan hit its cap of {WAITING_SENT_CAP}, older sent "
-                         "messages were not checked")
-            if len(inbound) >= WAITING_INBOUND_CAP:
-                note += (f"; WARNING: inbox scan hit its cap of {WAITING_INBOUND_CAP}, some replies "
-                         "were not seen, so entries may be falsely listed as waiting")
-            return {"items": waiting, "count": len(waiting), "note": note}
+                         "messages were not checked - lower lookback_days")
+            capped = [path for (path, _), rows in zip(folders, per_folder, strict=True) if len(rows) >= WAITING_INBOUND_CAP]
+            if capped:
+                note += (f"; WARNING: reply scan hit its cap of {WAITING_INBOUND_CAP} in {', '.join(capped)}, "
+                         "some replies were not seen, so entries may be falsely listed as waiting")
+            return {"items": items, "count": len(items), "note": note}
         return await ctx.gateway.call(work)
 
     @r.tool("read", "read")

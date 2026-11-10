@@ -168,3 +168,163 @@ async def test_search_falls_back_to_subject_when_body_restriction_rejected(serve
     folder.filter.side_effect = [bad, bad, good]  # item:Body, then PR_BODY rejected
     ok, res = await call(mcp, "search_messages", {"query": "budget"})
     assert ok and "subjects only" in res["note"]
+
+
+def test_resolve_folder_reloads_stale_folder_tree():
+    """exchangelib caches the folder tree for the life of the account: a folder created
+    in another client is found after one cache reload instead of failing forever."""
+    from ews_mcp_lite.aliases import AliasStore
+    from ews_mcp_lite.errors import Failure
+    from ews_mcp_lite.tools.common import resolve_folder
+
+    new = SimpleNamespace(name="Projects", children=[])
+    root = SimpleNamespace(name="root", children=[])
+    reloads = []
+
+    def clear_cache():
+        reloads.append(1)
+        root.children = [new]
+
+    account = SimpleNamespace(msg_folder_root=root, root=SimpleNamespace(clear_cache=clear_cache))
+    assert resolve_folder(account, "projects", AliasStore()) is new
+    assert len(reloads) == 1
+    with pytest.raises(Failure) as e:
+        resolve_folder(account, "Nope/Deeper", AliasStore())
+    assert e.value.code == "not_found"
+
+
+def test_mapi_conversation_id_from_grommunio_ews_id():
+    import base64
+    raw = bytes(range(16))
+    assert compat.mapi_conversation_id(base64.b64encode(raw + b"\x01").decode()) == raw
+    assert compat.mapi_conversation_id("AAQkAGI2not-a-grommunio-id") is None  # Exchange ids: leave alone
+    assert compat.mapi_conversation_id(base64.b64encode(b"x" * 40).decode()) is None
+
+
+@pytest.mark.anyio
+async def test_get_thread_filters_on_mapi_conversation_id_for_grommunio(server_factory):
+    import base64
+    raw = bytes(range(16))
+    conv = base64.b64encode(raw + b"\x01").decode()
+    for server_type, expected in (("grommunio", {"pr_conversation_id": raw}), ("exchange", None)):
+        mcp, ctx, gw = server_factory(ews_server_type=server_type)
+        acct = gw.mock_account
+        for folder in (acct.inbox, acct.sent):
+            folder.filter.return_value.only.return_value.__getitem__.return_value = []
+        ok, res = await call(mcp, "get_thread", {"id": ctx.aliases.alias(conv, "t")})
+        assert ok and res["count"] == 0, res
+        kwargs = acct.inbox.filter.call_args.kwargs
+        if expected:
+            assert kwargs == expected
+        else:
+            assert list(kwargs) == ["conversation_id"] and kwargs["conversation_id"].id == conv
+
+
+# ------------------------------------------------------------------ attachments
+
+
+def _att(name, *, size=10, inline=False, cid=None, content=None, ctype="text/plain"):
+    from exchangelib import FileAttachment
+    from exchangelib.attachments import AttachmentId
+    a = FileAttachment(name=name, content_type=ctype, size=size, is_inline=inline, content_id=cid)
+    if content is None:  # as fetched from a server: content stays there until read
+        a.attachment_id = AttachmentId(id=f"ATT-{name}")
+    else:
+        a._content = content
+    return a
+
+
+def _with_attachments(gw, atts, html="<p>hi</p>"):
+    from exchangelib import HTMLBody
+    item = SimpleNamespace(id="RAW-1", changekey="CK", subject="S", sender=None, text_body="hi", body=HTMLBody(html),
+                           conversation_id=None, is_read=True, has_attachments=True, importance="Normal",
+                           categories=None, datetime_received=None, datetime_sent=None, datetime_created=None,
+                           to_recipients=[], cc_recipients=[], attachments=atts)
+    gw.mock_account.fetch.return_value = [item]
+    return item
+
+
+@pytest.mark.anyio
+async def test_get_attachment_refuses_big_files_before_downloading(server_factory):
+    mcp, ctx, gw = server_factory()
+    # attachment_id set and no account: any download attempt would raise
+    _with_attachments(gw, [_att("video.mp4", size=30 * 1024 * 1024, ctype="video/mp4")])
+    ok, res = await call(mcp, "get_attachment", {"message_id": ctx.aliases.alias("RAW-1", "m")})
+    assert ok, res
+    assert res["mode"] == "metadata" and "not downloaded" in res["note"] and res["size_bytes"] == 30 * 1024 * 1024
+
+
+def test_read_capped_stops_when_the_server_sends_no_size():
+    import io
+
+    from ews_mcp_lite.tools.mail import _read_capped
+    reads = []
+
+    class Stream(io.BytesIO):  # stand-in for the GetAttachment stream
+        def read(self, n=-1):
+            reads.append(n)
+            return super().read(n)
+
+    def remote(data: bytes):
+        return SimpleNamespace(_content=None, attachment_id="ATT-1", fp=Stream(data), _fp="open")
+    att = remote(b"x" * 1000)
+    assert _read_capped(att, 100) is None and reads == [101], "reads at most cap+1 bytes"
+    assert att._fp is None, "a cut-short stream is not reused"
+    assert _read_capped(remote(b"x" * 1000), 5000) == b"x" * 1000
+    assert _read_capped(SimpleNamespace(_content=b"local", attachment_id=None), 100) == b"local"
+
+
+@pytest.mark.anyio
+async def test_inline_images_are_listed_apart_and_skipped_by_default(server_factory):
+    mcp, ctx, gw = server_factory()
+    atts = [_att("logo.png", inline=True, cid="logo1", ctype="image/png"),
+            _att("signature.png", cid="sig@x", ctype="image/png"),  # not flagged inline, but referenced by cid:
+            _att("report.csv", content=b"a,b\n1,2\n", ctype="text/csv")]
+    _with_attachments(gw, atts, '<img src="cid:logo1"><p>see report</p><img src="CID:sig@x">')
+    mid = ctx.aliases.alias("RAW-1", "m")
+    ok, res = await call(mcp, "get_message", {"id": mid})
+    msg = res["message"]
+    assert [a["name"] for a in msg["attachments"]] == ["report.csv"] and msg["attachments"][0]["index"] == 2
+    assert [(a["name"], a["index"]) for a in msg["inline_images"]] == [("logo.png", 0), ("signature.png", 1)]
+    ok, res = await call(mcp, "get_attachment", {"message_id": mid})
+    assert ok and res["name"] == "report.csv" and res["text"] == "a,b\n1,2\n" and "inline" not in res
+
+
+@pytest.mark.anyio
+async def test_get_attachment_with_only_inline_images_points_to_them(server_factory):
+    mcp, ctx, gw = server_factory()
+    _with_attachments(gw, [_att("logo.png", inline=True, cid="l", content=b"PNG", ctype="image/png")])
+    mid = ctx.aliases.alias("RAW-1", "m")
+    ok, err = await call(mcp, "get_attachment", {"message_id": mid})
+    assert not ok and err["code"] == "not_found" and "inline image" in err["message"], err
+    ok, res = await call(mcp, "get_attachment", {"message_id": mid, "attachment": "0"})
+    assert ok and res["inline"] is True and res["mode"] == "base64"
+
+
+@pytest.mark.anyio
+async def test_get_thread_keeps_the_starting_message_from_a_subfolder(server_factory):
+    """The conversation is gathered from Inbox and Sent Items; a message opened from
+    another folder (found via folder='all') must still be part of its own thread."""
+    from datetime import timedelta
+
+    mcp, ctx, gw = server_factory()
+    now = datetime.now(UTC)
+
+    def msg(raw, days_ago, body):
+        when = now - timedelta(days=days_ago)
+        return SimpleNamespace(id=raw, changekey="CK", subject="Atlas plan", sender=None, author=None,
+                               text_body=body, body=None, conversation_id=SimpleNamespace(id="CONV-1"),
+                               is_read=True, has_attachments=False, importance="Normal", categories=None,
+                               datetime_received=when, datetime_sent=when, datetime_created=when,
+                               to_recipients=[], cc_recipients=[], attachments=[])
+    filed, reply = msg("RAW-FILED", 2, "first, filed in Projects"), msg("RAW-REPLY", 1, "reply in the Inbox")
+    acct = gw.mock_account
+    acct.fetch.return_value = [filed]
+    acct.inbox.filter.return_value.only.return_value.__getitem__.return_value = [reply]
+    acct.sent.filter.return_value.only.return_value.__getitem__.return_value = []
+    ok, res = await call(mcp, "get_thread", {"id": ctx.aliases.alias("RAW-FILED", "m")})
+    assert ok, res
+    assert [i["body"] for i in res["items"]] == ["first, filed in Projects", "reply in the Inbox"]
+    acct.inbox.filter.return_value.only.return_value.__getitem__.return_value = [filed, reply]
+    ok, res = await call(mcp, "get_thread", {"id": ctx.aliases.alias("RAW-FILED", "m")})
+    assert res["count"] == 2, "no duplicate when the starting message is in the Inbox"

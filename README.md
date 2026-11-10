@@ -75,12 +75,12 @@ list/search tool). Raw EWS ids are accepted too.
 | Tool | Tier | Kind | What it does |
 |---|---|---|---|
 | `list_folders` | read | read | Folder tree with total/unread counts (`f` ids) |
-| `search_messages` | read | read | Live search in a folder: text, sender, subject, dates, unread, attachments |
-| `get_message` | read | read | One message: recipients, cleaned body, attachment list |
+| `search_messages` | read | read | Live search in one folder or all mail folders: text, sender, subject, dates, unread, attachments |
+| `get_message` | read | read | One message: recipients, cleaned body, attachments and inline images listed apart |
 | `get_thread` | read | read | Conversation from Inbox + Sent Items, oldest first |
-| `get_attachment` | read | read | One attachment as text, base64 (≤ 512 KiB) or metadata |
+| `get_attachment` | read | read | One attachment as text, base64 (≤ 512 KiB) or metadata; big files are not downloaded |
 | `get_mailbox_overview` | read | read | Unread count, newest unread cards, today's events |
-| `waiting_on` | read | read | Sent mail with no reply after N days (live scan, capped at 200) |
+| `waiting_on` | read | read | Sent mail with no reply after N days, optionally to one person (live scan of up to 1,000 sent) |
 | `list_events` | read | read | Events in a window, recurrences expanded (`e` ids) |
 | `get_event` | read | read | One event with attendees and responses |
 | `check_availability` | read | read | Free/busy for attendees plus up to 5 common free slots |
@@ -184,8 +184,9 @@ confirming call.
     wrong. grommunio reports Exchange 2013 SP1 (`15.0.847.4040`); when the server reports
     that build while `EWS_SERVER_TYPE=exchange`, the connect log warns about it.
 - Logging: at startup the search config is logged; on connect the server build and
-  configured type. Every `search_messages` call logs one INFO line (folder, mode, body
-  field, which filters were used, hits, items scanned client-side, duration), never the
+  configured type. Every `search_messages` call logs one INFO line (folder, number of
+  folders searched, mode, body field, sender mode, which filters were used, hits, items
+  scanned client-side, duration), never the
   search terms or addresses themselves; the AQS string is logged at DEBUG only. Fallbacks
   and capped results are logged as WARNING. `get_server_status` reports the search config.
 
@@ -269,8 +270,14 @@ Integration tests tag everything they create with a unique marker and delete it 
   returns the whole folder unfiltered. `EWS_SERVER_TYPE=grommunio` uses restrictions
   instead, and `EWS_SEARCH_MODE=aqs` is refused with that server type.
 - Attendee properties of plain appointments fail (E-3127): see `get_event` above.
-- Filtering by conversation id returns nothing: `get_thread` shows only the message
-  itself, and `waiting_on` matches replies by conversation id and normalized subject.
+- Filtering by `item:ConversationId` returns nothing (without an error). With
+  `EWS_SERVER_TYPE=grommunio`, `get_thread` filters on the MAPI property
+  PR_CONVERSATION_ID (0x3013) instead, which works. gromox appears to derive that id
+  from the subject: unrelated mails with the same subject and no reply headers ended up
+  in one thread in testing.
+- Items saved through EWS with only `From` set have no PR_SENDER_* properties; the
+  sender-name search therefore also matches the sent-representing ("From") name and
+  address.
 - Room lists (`GetRoomLists`) are not supported.
 
 ### Testing the agentic flow

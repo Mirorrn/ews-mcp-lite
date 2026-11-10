@@ -26,4 +26,5 @@ dev/grommunio/.work/
 
 # realistic seed output and agentic test runs
 dev/grommunio/seed_manifest.json
+dev/grommunio/seed_scale_manifest.json
 tests/agentic/runs/

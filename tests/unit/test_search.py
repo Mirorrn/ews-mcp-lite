@@ -14,6 +14,7 @@ from ews_mcp_lite.tools.mail import CARD_FIELDS, SENDER_SCAN_CAP
 from tests.conftest import EXCHANGE_2016, FakeGateway, call, make_settings
 
 NOW = datetime.now(UTC)
+REJECTED = type("ErrorInvalidRestriction", (Exception,), {})("E-3224")
 
 
 def _item(i: int, *, days_ago: float = 0, name: str = "Bob"):
@@ -151,7 +152,7 @@ async def test_aqs_dates_are_applied_to_index_hits_and_only_the_page_is_fetched(
                                                   "offset": 1, "limit": 3})
     assert ok, res
     assert qstr(folder.queries[0]) == '"budget"*'  # no AQS date syntax
-    assert folder.made[0].only_fields == ("id", "changekey", "sender", "datetime_received", "datetime_sent")
+    assert folder.made[0].only_fields == ("id", "changekey", "datetime_received", "datetime_sent")
     # in range: days 2..8 -> page offset 1, limit 3 = days 3, 4, 5
     assert [c["subject"] for c in res["items"]] == ["S3", "S4", "S5"] and res["next_offset"] == 4
     assert "index hits only" not in res["note"]
@@ -159,13 +160,25 @@ async def test_aqs_dates_are_applied_to_index_hits_and_only_the_page_is_fetched(
 
 @pytest.mark.anyio
 async def test_aqs_dates_warn_when_index_cap_reached(server_factory):
+    """All index hits are newer than `until`: the scan runs out before a page is full."""
+    mcp, _, gw = server_factory(ews_search_mode="aqs")
+    hits = [_item(i, days_ago=0.001 * i) for i in range(aqs.AQS_HIT_CAP)]
+    folder, by_id = _setup(gw, lambda q: FakeQS(hits))
+    by_id.update({m.id: m for m in hits})
+    ok, res = await call(mcp, "search_messages", {"query": "budget", "until": "-2d", "limit": 2})
+    assert ok and res["items"] == [], res
+    assert f"date range applied to the newest {aqs.AQS_HIT_CAP} index hits only" in res["note"]
+
+
+@pytest.mark.anyio
+async def test_aqs_dates_full_page_is_not_reported_incomplete(server_factory):
     mcp, _, gw = server_factory(ews_search_mode="aqs")
     hits = [_item(i, days_ago=0.001 * i) for i in range(aqs.AQS_HIT_CAP)]
     folder, by_id = _setup(gw, lambda q: FakeQS(hits))
     by_id.update({m.id: m for m in hits})
     ok, res = await call(mcp, "search_messages", {"query": "budget", "since": "-30d", "limit": 2})
-    assert ok, res
-    assert f"date range applied to the newest {aqs.AQS_HIT_CAP} index hits only" in res["note"]
+    assert ok and len(res["items"]) == 2 and res["next_offset"] == 2
+    assert "incomplete" not in res["note"]
 
 
 @pytest.mark.anyio
@@ -317,7 +330,8 @@ async def test_search_logs_aqs_failure_and_fallback(server_factory, caplog):
 @pytest.mark.anyio
 async def test_search_warns_when_result_is_capped(server_factory, caplog):
     mcp, _, gw = server_factory(ews_server_type="grommunio")
-    _setup(gw, lambda q: FakeQS([_item(i) for i in range(SENDER_SCAN_CAP)]))
+    _setup(gw, lambda q: FakeQS([_item(i) for i in range(SENDER_SCAN_CAP)],
+                                error=REJECTED if "pr_sender" in repr(q) else None))
     with caplog.at_level(logging.INFO, logger="ews_mcp_lite.tools.mail"):
         ok, res = await call(mcp, "search_messages", {"sender": "nobody-matches"})
     assert ok and "incomplete" in res["note"]
@@ -382,3 +396,91 @@ def test_fetch_one_without_only_skips_pr_body():
     names = {f.name for f in account.fetch.call_args.kwargs["only_fields"]}
     assert "pr_body" not in names and {"subject", "body", "text_body", "start", "due_date"} <= names
     assert "folder" not in account.fetch.call_args.kwargs  # exchangelib's all-item-types default
+
+
+# ------------------------------------------------------------------ folder='all'
+
+
+def _tree_folder(name, *, cls=None, folder_class="IPF.Note", total=5, children=()):
+    """A folder-tree node; cls makes it an instance of an exchangelib folder class."""
+    if cls is None:
+        return SimpleNamespace(name=name, folder_class=folder_class, total_count=total, children=list(children),
+                               child_folder_count=len(children))
+    sub = type(cls.__name__, (cls,), {"children": property(lambda self: self.__dict__["kids"])})
+    node = sub.__new__(sub)  # no EWS round trip: only isinstance() and the attributes below matter
+    for k, v in dict(name=name, folder_class=folder_class, total_count=total, kids=list(children),
+                     child_folder_count=len(children)).items():
+        object.__setattr__(node, k, v)
+    return node
+
+
+def test_mail_folders_skips_system_and_non_mail_folders():
+    from exchangelib.folders import Calendar, DeletedItems, Drafts, JunkEmail, SentItems, SyncIssues
+
+    from ews_mcp_lite.tools.common import mail_folders
+    atlas = _tree_folder("Atlas")
+    tree = [
+        _tree_folder("Inbox", children=[_tree_folder("Projects", total=0, children=[atlas])]),
+        _tree_folder("Sent Items", cls=SentItems),
+        _tree_folder("Deleted Items", cls=DeletedItems, children=[_tree_folder("Old")]),
+        _tree_folder("Junk Email", cls=JunkEmail),
+        _tree_folder("Drafts", cls=Drafts),
+        _tree_folder("Sync Issues", cls=SyncIssues, children=[_tree_folder("Conflicts")]),
+        _tree_folder("Calendar", cls=Calendar, folder_class="IPF.Appointment"),
+        _tree_folder("RSS Feeds", folder_class="IPF.Note.OutlookHomepage"),
+        _tree_folder("Archive", total=0, children=[_tree_folder("2024")]),
+    ]
+    reloaded = []
+    account = SimpleNamespace(msg_folder_root=SimpleNamespace(children=tree),
+                              root=SimpleNamespace(clear_cache=lambda: reloaded.append(1)))
+    paths = [p for p, _ in mail_folders(account)]
+    assert paths == ["Inbox", "Inbox/Projects/Atlas", "Sent Items", "Archive/2024"], "empty folders are skipped"
+    assert reloaded, "the folder tree is re-read for fresh counts"
+    assert [p for p, _ in mail_folders(account, skip=(SentItems,))] == ["Inbox", "Inbox/Projects/Atlas",
+                                                                        "Archive/2024"]
+
+
+def _two_folders(monkeypatch, gw, inbox_rows, atlas_rows):
+    from ews_mcp_lite.tools import mail
+    inbox, atlas = FakeFolder(lambda q: FakeQS(inbox_rows)), FakeFolder(lambda q: FakeQS(atlas_rows))
+    monkeypatch.setattr(mail, "mail_folders", lambda account, skip=(): [("Inbox", inbox), ("Inbox/Atlas", atlas)])
+    by_id = {m.id: m for m in inbox_rows + atlas_rows}
+    gw.mock_account.fetch.side_effect = lambda ids, folder, only_fields: [by_id[i] for i, _ in ids]
+    return inbox, atlas
+
+
+@pytest.mark.anyio
+async def test_search_all_merges_folders_newest_first_and_names_the_folder(server_factory, monkeypatch):
+    mcp, _, gw = server_factory(ews_server_type="grommunio")
+    inbox_rows = [_item(i, days_ago=d) for i, d in ((1, 0), (2, 2), (3, 4))]
+    atlas_rows = [_item(i, days_ago=d) for i, d in ((10, 1), (11, 3))]
+    inbox, atlas = _two_folders(monkeypatch, gw, inbox_rows, atlas_rows)
+    ok, res = await call(mcp, "search_messages", {"query": "plan", "limit": 3})
+    assert ok, res
+    assert [(c["subject"], c["folder"]) for c in res["items"]] == [("S1", "Inbox"), ("S10", "Inbox/Atlas"),
+                                                                   ("S2", "Inbox")]
+    assert res["next_offset"] == 3 and res["note"].startswith("searched 2 mail folders")
+    assert inbox.made[0].only_fields == ("id", "changekey", "datetime_received", "datetime_sent"), \
+        "folders are read light; only the page is fetched in full"
+    ok, res = await call(mcp, "search_messages", {"query": "plan", "offset": 3, "limit": 3})
+    assert [c["subject"] for c in res["items"]] == ["S11", "S3"] and res["next_offset"] is None
+
+
+@pytest.mark.anyio
+async def test_search_default_scope_all_for_searches_inbox_for_listing(server_factory, monkeypatch):
+    mcp, _, gw = server_factory(ews_server_type="grommunio")
+    inbox, atlas = _two_folders(monkeypatch, gw, [_item(1)], [_item(2)])
+    gw.mock_account.inbox = FakeFolder(lambda q: FakeQS([_item(3)]))
+    for args, expected in (({"sender": "bob"}, {"S1", "S2"}), ({"subject": "S"}, {"S1", "S2"}),
+                           ({}, {"S3"}), ({"unread_only": True}, {"S3"}),
+                           ({"query": "x", "folder": "inbox"}, {"S3"}), ({"folder": "all"}, {"S1", "S2"})):
+        ok, res = await call(mcp, "search_messages", args)
+        assert ok and {c["subject"] for c in res["items"]} == expected, (args, res)
+        assert all(("folder" in c) == (expected != {"S3"}) for c in res["items"]), args
+
+
+@pytest.mark.anyio
+async def test_search_all_limits_the_page_window(server_factory):
+    mcp, _, _ = server_factory()
+    ok, res = await call(mcp, "search_messages", {"query": "x", "offset": 990, "limit": 20})
+    assert not ok and res["code"] == "validation" and "folder='all'" in res["message"]

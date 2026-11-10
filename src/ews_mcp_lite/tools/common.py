@@ -1,20 +1,34 @@
 """Helpers shared by the tool modules (all run on worker threads)."""
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 from typing import Any
 
 from exchangelib import CalendarItem, Mailbox
-from exchangelib.folders import Folder
+from exchangelib.folders import (
+    ConversationHistory,
+    DeletedItems,
+    Drafts,
+    Folder,
+    JunkEmail,
+    Outbox,
+    SyncIssues,
+)
 from exchangelib.properties import ItemId
 from exchangelib.queryset import QuerySet
 
 from ..aliases import AliasStore, is_alias
-from ..compat import fields_without_pr_body
+from ..compat import fields_without_mapi_extras
 from ..errors import Failure, classify
 
 MAX_LIMIT = 100
 MAX_BULK = 50
 ATTENDEE_FIELDS = ("required_attendees", "optional_attendees", "resources")
+# Parallel EWS requests for multi-folder work; matches the account's max_connections.
+FOLDER_WORKERS = 4
+# Folders (and their subtrees) that are never part of a mailbox-wide search.
+NOT_SEARCHED = (DeletedItems, JunkEmail, Drafts, Outbox, SyncIssues, ConversationHistory)
 
 WELL_KNOWN = {
     "inbox": "inbox", "sent": "sent", "sent items": "sent", "drafts": "drafts",
@@ -55,21 +69,72 @@ def resolve_folder(account: Any, ref: str, aliases: AliasStore) -> Any:
         raw, _ = aliases.resolve(key, expect=("f",))
         return _folder_by_id(account, raw)
     if "/" in key or len(key) < 40:  # a path; raw EWS folder ids are much longer
-        node = account.msg_folder_root
-        for part in [p for p in key.split("/") if p]:
-            match = next((c for c in node.children if (c.name or "").lower() == part.lower()), None)
-            if match is None:
-                raise Failure("not_found", f"No folder matches '{key}'.",
-                              "Use list_folders and pass one of its ids or paths.")
-            node = match
+        node = _walk_path(account, key)
+        if node is None:  # maybe created after the folder tree was cached: reload once
+            refresh_folders(account)
+            node = _walk_path(account, key)
+        if node is None:
+            raise Failure("not_found", f"No folder matches '{key}'.",
+                          "Use list_folders and pass one of its ids or paths.")
         return node
     return _folder_by_id(account, key)
 
 
+def refresh_folders(account: Any) -> None:
+    """Drop exchangelib's folder-tree cache. It is filled once per account and never
+    updated, so folders created elsewhere and item counts would stay stale for the
+    life of the server."""
+    clear = getattr(getattr(account, "root", None), "clear_cache", None)
+    if callable(clear):
+        clear()
+
+
+def mail_folders(account: Any, skip: tuple[type, ...] = ()) -> list[tuple[str, Any]]:
+    """Every non-empty mail folder as (path, folder), from a fresh folder tree.
+    Leaves out Deleted Items, Junk, Drafts, Outbox, Sync Issues and Conversation
+    History with their subfolders, folder types in `skip`, and non-mail folders
+    (calendar, contacts, RSS …). Empty list when the tree cannot be read."""
+    refresh_folders(account)
+    out: list[tuple[str, Any]] = []
+
+    def walk(folder: Any, prefix: str) -> None:
+        for child in folder.children:
+            if isinstance(child, NOT_SEARCHED + skip):
+                continue
+            path = f"{prefix}{child.name}"
+            if (child.folder_class or "IPF.Note") == "IPF.Note" and child.total_count:
+                out.append((path, child))
+            if child.child_folder_count:
+                walk(child, path + "/")
+    walk(account.msg_folder_root, "")
+    return out
+
+
+def parallel[T](fn: Callable[[Any], T], entries: list[Any]) -> list[T]:
+    """fn over entries on up to FOLDER_WORKERS threads, results in input order.
+    The first exception is re-raised."""
+    if len(entries) <= 1:
+        return [fn(e) for e in entries]
+    with ThreadPoolExecutor(max_workers=min(FOLDER_WORKERS, len(entries))) as pool:
+        return list(pool.map(fn, entries))
+
+
+def _walk_path(account: Any, key: str) -> Any:
+    node = account.msg_folder_root
+    for part in [p for p in key.split("/") if p]:
+        node = next((c for c in node.children if (c.name or "").lower() == part.lower()), None)
+        if node is None:
+            return None
+    return node
+
+
 def _folder_by_id(account: Any, raw: str) -> Any:
-    for f in account.msg_folder_root.walk():
-        if f.id == raw:
-            return f
+    for attempt in (0, 1):
+        for f in account.msg_folder_root.walk():
+            if f.id == raw:
+                return f
+        if attempt == 0:
+            refresh_folders(account)
     raise Failure("not_found", "Folder id not found.", "Use list_folders to get fresh ids.")
 
 
@@ -81,7 +146,7 @@ def full_fields(account: Any) -> list[Any]:
     v = account.version
     key = (v.build, v.api_version)
     if key not in _FULL_FIELDS:
-        _FULL_FIELDS[key] = fields_without_pr_body(Folder.allowed_item_fields(version=v))
+        _FULL_FIELDS[key] = fields_without_mapi_extras(Folder.allowed_item_fields(version=v))
     return _FULL_FIELDS[key]
 
 
