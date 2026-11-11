@@ -63,6 +63,16 @@ perl -pi -e 's/^(\s*- )"(\d+):(\d+)"/sprintf(q{%s"127.0.0.1:%d:%d"}, $1, $2 + 10
 if [ "$(uname -m)" != "x86_64" ]; then
   perl -pi -e 's/^(  gromox-office:\n)/$1    platform: linux\/amd64\n/' "$WORK/docker-compose.yml"
 fi
+# env_file entries in the long form (path:/required:) need Compose >= 2.24 and
+# break podman-compose 1.x: list the env files that exist as plain paths instead
+# (same order, so the same precedence).
+env_files=""
+for f in var.env variables_data/var.env var.local.env; do
+  if [ -f "$WORK/$f" ]; then env_files+="  - $f"$'\n'; fi
+done
+ENV_FILES="$env_files" perl -0pi -e \
+  's/^(x-env: &grommunio-env\n)(?:  - path: .*\n    required: .*\n)+/$1$ENV{ENV_FILES}/m' \
+  "$WORK/docker-compose.yml"
 
 # 4. build + start -------------------------------------------------------------
 log "docker compose up -d --build (first run is slow)"
