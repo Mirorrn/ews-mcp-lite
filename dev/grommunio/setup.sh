@@ -6,7 +6,8 @@
 #   dev/grommunio/setup.sh        # build + start + users + seed (idempotent)
 #   dev/grommunio/teardown.sh     # stop and DELETE all data
 #
-# Needs: git, Docker with Compose >= 2.24, uv. First run takes ~10 minutes.
+# Needs: git, uv and Docker Compose or podman (podman-compose works, no API
+# socket needed). First run takes ~10 minutes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +20,7 @@ FQDN="mail.$DOMAIN"
 ADMIN_PASS="${GROMMUNIO_ADMIN_PASS:-GrommAdmin-4711}"
 ALICE_PASS="${ALICE_PASS:-Al1cePass!}"
 BOB_PASS="${BOB_PASS:-B0bPass!!}"
-EWS_URL="https://127.0.0.1/EWS/Exchange.asmx"
+EWS_URL="https://127.0.0.1:10443/EWS/Exchange.asmx"
 
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 
@@ -49,12 +50,19 @@ SSL_INSTALL_TYPE=0
 ENABLE_CHAT=false
 TIMEZONE=Europe/Berlin
 ENV
-cat > "$WORK/docker-compose.override.yml" <<'YML'
+# Patch the upstream compose file in place (step 1 resets it on every run) instead of
+# using docker-compose.override.yml: that keeps the stack startable with
+# podman-compose, which cannot replace a port list from an override file.
+rm -f "$WORK/docker-compose.override.yml"
+# gromox-core: publish on 127.0.0.1 only, at host port = standard port + 10000
+# (25 -> 10025, 443 -> 10443, admin 8443 -> 18443), so rootless podman can bind
+# them (no ports < 1024) and nothing is exposed to the network.
+perl -pi -e 's/^(\s*- )"(\d+):(\d+)"/sprintf(q{%s"127.0.0.1:%d:%d"}, $1, $2 + 10000, $3)/e' \
+  "$WORK/docker-compose.yml"
 # grommunio-office has no aarch64 build: run that one image as x86_64.
-services:
-  gromox-office:
-    platform: linux/amd64
-YML
+if [ "$(uname -m)" != "x86_64" ]; then
+  perl -pi -e 's/^(  gromox-office:\n)/$1    platform: linux\/amd64\n/' "$WORK/docker-compose.yml"
+fi
 
 # 4. build + start -------------------------------------------------------------
 log "docker compose up -d --build (first run is slow)"
@@ -81,14 +89,14 @@ done
 
 # 6. seed ----------------------------------------------------------------------
 log "seeding test data"
-(cd "$HERE/../.." && ALICE_PASS="$ALICE_PASS" BOB_PASS="$BOB_PASS" uv run python dev/grommunio/seed.py)
+(cd "$HERE/../.." && EWS_URL="$EWS_URL" ALICE_PASS="$ALICE_PASS" BOB_PASS="$BOB_PASS" uv run python dev/grommunio/seed.py)
 
 cat <<DONE
 
 grommunio is up.
   EWS        $EWS_URL
-  Webmail    https://127.0.0.1/web/
-  Admin UI   https://127.0.0.1:8443/   (admin / $ADMIN_PASS)
+  Webmail    https://127.0.0.1:10443/web/
+  Admin UI   https://127.0.0.1:18443/   (admin / $ADMIN_PASS)
   Users      alice@$DOMAIN / $ALICE_PASS     bob@$DOMAIN / $BOB_PASS
-NOTE: the stack publishes its ports on ALL interfaces (443, 25, 993, 8443 ...).
+Ports are published on 127.0.0.1 only (standard port + 10000; admin UI on 18443).
 DONE

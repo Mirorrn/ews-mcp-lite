@@ -63,7 +63,7 @@ compat.apply()  # grommunio sends fractional-second timestamps
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter  # self-signed dev certificate
 
-URL = os.environ.get("EWS_SERVER_URL", "https://127.0.0.1/EWS/Exchange.asmx")
+URL = os.environ.get("EWS_SERVER_URL", "https://127.0.0.1:10443/EWS/Exchange.asmx")
 TZ = EWSTimeZone(os.environ.get("EWS_TZ", "Europe/Berlin"))
 A = os.environ.get("SEED_ALICE", "alice@grommunio.test")
 B = os.environ.get("SEED_BOB", "bob@grommunio.test")

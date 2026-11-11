@@ -29,7 +29,7 @@ from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter  # the dev stack uses a self-signed certificate
 
-URL = os.environ.get("EWS_URL", "https://127.0.0.1/EWS/Exchange.asmx")
+URL = os.environ.get("EWS_URL", "https://127.0.0.1:10443/EWS/Exchange.asmx")
 TZ = EWSTimeZone("Europe/Berlin")
 A, B = "alice@grommunio.test", "bob@grommunio.test"
 
