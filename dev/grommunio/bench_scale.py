@@ -58,7 +58,7 @@ CASES = [
 
 
 async def main() -> None:
-    s = Settings(_env_file=None, ews_server_url=os.environ.get("EWS_SERVER_URL", "https://127.0.0.1/EWS/Exchange.asmx"),
+    s = Settings(_env_file=None, ews_server_url=os.environ.get("EWS_SERVER_URL", "https://127.0.0.1:10443/EWS/Exchange.asmx"),
                  ews_email="alice@grommunio.test", ews_password=os.environ.get("ALICE_PASS", "Al1cePass!"),
                  ews_insecure_skip_verify=True, ews_tz="Europe/Berlin", ews_server_type="grommunio",
                  ews_capability_tier="read", circuit_failure_threshold=1000)
