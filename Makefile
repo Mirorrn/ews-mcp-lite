@@ -6,7 +6,7 @@
 #   make test        unit tests
 
 GROMMUNIO := dev/grommunio/.work/gromox-container
-EWS_URL   := https://127.0.0.1/EWS/Exchange.asmx
+EWS_URL   := https://127.0.0.1:10443/EWS/Exchange.asmx
 
 .PHONY: setup-dev dev stop test
 

@@ -215,9 +215,9 @@ Once it is up (the certificate is self-signed, so the browser warns first):
 
 | What | URL | Login (setup.sh defaults) |
 |---|---|---|
-| Webmail (grommunio-web) | https://127.0.0.1/web/ | `alice@grommunio.test` / `Al1cePass!` or `bob@grommunio.test` / `B0bPass!!` |
-| Admin UI | https://127.0.0.1:8443/ | `admin` / `GrommAdmin-4711` |
-| EWS endpoint | https://127.0.0.1/EWS/Exchange.asmx | as webmail |
+| Webmail (grommunio-web) | https://127.0.0.1:10443/web/ | `alice@grommunio.test` / `Al1cePass!` or `bob@grommunio.test` / `B0bPass!!` |
+| Admin UI | https://127.0.0.1:18443/ | `admin` / `GrommAdmin-4711` |
+| EWS endpoint | https://127.0.0.1:10443/EWS/Exchange.asmx | as webmail |
 
 The passwords can be changed with `ALICE_PASS`, `BOB_PASS` and `GROMMUNIO_ADMIN_PASS`
 when running `setup.sh`.
@@ -236,7 +236,7 @@ uv run ews-mcp-lite
 Then run the integration suite against it:
 
 ```bash
-export EWS_IT_URL=https://127.0.0.1/EWS/Exchange.asmx EWS_IT_INSECURE=1 EWS_IT_TZ=Europe/Berlin \
+export EWS_IT_URL=https://127.0.0.1:10443/EWS/Exchange.asmx EWS_IT_INSECURE=1 EWS_IT_TZ=Europe/Berlin \
        EWS_IT_USER=alice@grommunio.test EWS_IT_PASSWORD='Al1cePass!' \
        EWS_IT_PEER=bob@grommunio.test   EWS_IT_PEER_PASSWORD='B0bPass!!' \
        EWS_IT_SERVER_TYPE=grommunio
@@ -254,8 +254,9 @@ Integration tests tag everything they create with a unique marker and delete it 
   CPU and never answer. The core must be built natively (the script does).
 - `gromox-timer` fails to start (its binary is missing from the current package). It only
   handles deferred delivery.
-- The stack publishes its ports (25, 80, 443, 465, 587, 993, 995, 8443 …) on **all
-  interfaces**, i.e. it is reachable from your network. Stop it when you are not using it.
+- The stack publishes its ports on **127.0.0.1 only**, at standard port + 10000 (EWS/web on
+  10443, SMTP on 10025, IMAPS on 10993 …; admin UI on 18443), so it also runs under rootless
+  podman/docker, which cannot bind ports below 1024.
 
 **grommunio EWS limitations** (lite works around them; real Exchange does not have them):
 
@@ -291,7 +292,7 @@ flow matters), not on the agent's prose.
 tier, sending on, but only to `*@grommunio.test`, no API key:
 
 ```bash
-EWS_SERVER_URL=https://127.0.0.1/EWS/Exchange.asmx
+EWS_SERVER_URL=https://127.0.0.1:10443/EWS/Exchange.asmx
 EWS_EMAIL=alice@grommunio.test
 EWS_PASSWORD=Al1cePass!
 EWS_INSECURE_SKIP_VERIFY=true

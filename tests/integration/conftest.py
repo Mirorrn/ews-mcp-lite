@@ -1,7 +1,7 @@
 """Live EWS integration tests (grommunio dev stack or a real Exchange test mailbox).
 
 Enable with:
-    EWS_IT_URL=https://127.0.0.1/EWS/Exchange.asmx
+    EWS_IT_URL=https://127.0.0.1:10443/EWS/Exchange.asmx
     EWS_IT_USER=alice@grommunio.test   EWS_IT_PASSWORD=...
     EWS_IT_PEER=bob@grommunio.test     EWS_IT_PEER_PASSWORD=...   (second mailbox)
     EWS_IT_INSECURE=1                  (self-signed certificate)
